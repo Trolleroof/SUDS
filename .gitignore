@@ -1,0 +1,16 @@
+# Python environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Vendored upstream clone (see SETUP.md to recreate)
+/lerobot/
+
+# LeRobot outputs
+outputs/
+wandb/
+data/
+*.mp4
+
+# macOS
+.DS_Store
