@@ -139,6 +139,41 @@ Per-invocation alternative, if you would rather not touch `site-packages`:
 DYLD_FALLBACK_LIBRARY_PATH="$UVP/lib" mjpython scripts/sim_leader.py
 ```
 
+## Episode review dashboard
+
+`dashboard/` is a Next.js app that reads a `LeRobotDataset` off disk and lets you
+mark each episode pass/fail. See `dashboard/README.md`.
+
+```bash
+cd dashboard && npm install && npm run dev   # http://localhost:3117
+```
+
+Verdicts land in `datasets/<namespace>__<name>.labels.jsonl`, outside the dataset
+directory so they survive a re-record. Generate a synthetic dataset to work
+against before the arms exist:
+
+```bash
+python scripts/make_stub_dataset.py --repo-id suds/stub --episodes 8
+```
+
+Recording is driven from the dashboard by a daemon that owns the arm and the
+dataset writer:
+
+```bash
+python scripts/record_server.py --repo-id suds/pick_sponge \
+    --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
+    --camera overhead=0 --camera wrist=1
+python scripts/record_server.py --repo-id suds/dev --mock   # no hardware
+```
+
+Space starts and stops a take, backspace throws it away, enter commits it early.
+Stopping holds the frames unwritten for a few seconds, so deleting a bad take is
+free.
+
+If you use `lerobot-record` directly instead, pass
+`--dataset.rgb_encoder.vcodec=h264`; LeRobot's AV1 default only plays
+in Safari on M3 and newer.
+
 ---
 
 ## Known benign warnings
