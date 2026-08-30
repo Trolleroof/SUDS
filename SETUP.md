@@ -93,6 +93,54 @@ lerobot-find-cameras   # enumerate camera indices for wrist/overhead views
 Record each of the four arms' ports; on macOS they appear as
 `/dev/tty.usbmodem*` and can change between reboots.
 
+## Simulation (MuJoCo)
+
+```bash
+VIRTUAL_ENV=$PWD/.venv uv pip install mujoco          # 3.12.0
+git clone --filter=blob:none --sparse --depth 1 \
+  https://github.com/TheRobotStudio/SO-ARM100.git
+cd SO-ARM100 && git sparse-checkout set Simulation/SO101   # ~21 MB
+```
+
+`SO-ARM100/` is gitignored like `lerobot/`. It supplies the SO-101 MJCF and
+meshes; it is also the URDF source LeRobot's own `lerobot-find-joint-limits`
+points at. The MJCF joint names match LeRobot's motor names 1:1 and in order,
+so no remapping is needed.
+
+### mjpython + uv Python: libpython3.12.dylib not loaded
+
+MuJoCo's interactive viewer must run under `mjpython` on macOS. Out of the box
+that fails here:
+
+```
+Library not loaded: @rpath/libpython3.12.dylib
+```
+
+`mjpython` is an app bundle, so it resolves `@rpath` against its own
+`Contents/lib`, but uv keeps the dylib in its managed Python install. Nothing
+in the search path bridges the two. (The VulkanSDK path that shows up in the
+dyld "tried" list is a red herring — it is just the first entry of the
+`DYLD_FALLBACK_LIBRARY_PATH` set in the shell profile, and is unrelated.)
+
+Fix, and **re-run this after any `uv pip install` that reinstalls mujoco**:
+
+```bash
+UVP=$(.venv/bin/python -c 'import sysconfig;print(sysconfig.get_config_var("installed_base"))')
+APP=".venv/lib/python3.12/site-packages/mujoco/MuJoCo_(mjpython).app/Contents"
+mkdir -p "$APP/lib"
+ln -sf "$UVP/lib/libpython3.12.dylib" "$APP/lib/libpython3.12.dylib"
+```
+
+Verify with `.venv/bin/mjpython -c "import mujoco; print('ok')"`.
+
+Per-invocation alternative, if you would rather not touch `site-packages`:
+
+```bash
+DYLD_FALLBACK_LIBRARY_PATH="$UVP/lib" mjpython scripts/sim_leader.py
+```
+
+---
+
 ## Known benign warnings
 
 - `objc[...]: Class AVFFrameReceiver is implemented in both ... libavdevice`

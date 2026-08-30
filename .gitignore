@@ -3,8 +3,9 @@
 __pycache__/
 *.py[cod]
 
-# Vendored upstream clone (see SETUP.md to recreate)
+# Vendored upstream clones (see SETUP.md to recreate)
 /lerobot/
+/SO-ARM100/
 
 # LeRobot outputs
 outputs/
