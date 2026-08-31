@@ -6,6 +6,7 @@ import type { DatasetPayload, EpisodeRow, Verdict } from "@/lib/api-types";
 import { useRecorder } from "@/lib/use-recorder";
 
 import CalibrationPanel from "./CalibrationPanel";
+import CommandBar from "./CommandBar";
 import DaemonPanel from "./DaemonPanel";
 import EpisodeList from "./EpisodeList";
 import HealthPanel from "./HealthPanel";
@@ -14,10 +15,23 @@ import LiveCameras from "./LiveCameras";
 import RecordBar from "./RecordBar";
 import SafetyBar from "./SafetyBar";
 import StatsStrip from "./StatsStrip";
+import TeleopSyncPanel from "./TeleopSyncPanel";
 import TracePanel from "./TracePanel";
 import VideoPanel from "./VideoPanel";
 
-type Filter = "all" | "unlabeled" | "pass" | "fail";
+type Filter = "all" | "unlabeled" | "pass" | "fail" | "discard";
+
+/**
+ * Two jobs, two screens.
+ *
+ * "Live" is what you look at with a leader arm in your hand: the arms, the
+ * cameras pointing at them right now, and the stop. "Review" is what you look at
+ * afterwards, with both hands free. Sharing one scroll made the live cameras sit
+ * above a *recording* of a camera, which is the one confusion worth designing
+ * out -- when the arm is moving you must never wonder whether the picture is
+ * from now.
+ */
+type View = "live" | "review";
 
 export default function Dashboard({ datasets: initial, root }: { datasets: string[]; root: string }) {
   const [datasets, setDatasets] = useState(initial);
@@ -29,6 +43,7 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
   const [filter, setFilter] = useState<Filter>("all");
+  const [view, setView] = useState<View>("live");
 
   const refresh = useCallback(async () => {
     void fetch("/api/datasets", { cache: "no-store" })
@@ -84,16 +99,19 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
     [visible, selected],
   );
 
-  const label = useCallback(
-    async (verdict: Verdict, patch: { failure_mode?: string | null; notes?: string | null } = {}) => {
-      if (!current) return;
-      const previous = current.label;
+  const labelEpisode = useCallback(
+    async (
+      episode: EpisodeRow,
+      verdict: Verdict,
+      patch: { failure_mode?: string | null; notes?: string | null } = {},
+    ) => {
+      const previous = episode.label;
       await fetch("/api/label", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           repo_id: repoId,
-          episode_index: current.episode_index,
+          episode_index: episode.episode_index,
           verdict,
           // Relabelling should not silently drop the notes already written.
           failure_mode: patch.failure_mode !== undefined ? patch.failure_mode : previous?.failure_mode ?? null,
@@ -102,7 +120,25 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
       });
       await refresh();
     },
-    [current, repoId, refresh],
+    [repoId, refresh],
+  );
+
+  const label = useCallback(
+    async (verdict: Verdict, patch: { failure_mode?: string | null; notes?: string | null } = {}) => {
+      if (!current) return;
+      await labelEpisode(current, verdict, patch);
+    },
+    [current, labelEpisode],
+  );
+
+  // A discard is excluded from the "all" list and from anything the finetune
+  // pipeline reads, but nothing on disk is touched -- reversible from "discarded".
+  const deleteEpisode = useCallback(
+    (index: number) => {
+      const episode = episodes.find((e) => e.episode_index === index);
+      if (episode) void labelEpisode(episode, "discard");
+    },
+    [episodes, labelEpisode],
   );
 
   // The point of the tool is labelling 50 episodes without touching the mouse.
@@ -128,25 +164,39 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
     return () => window.removeEventListener("keydown", onKey);
   }, [step, label]);
 
+  const recorderUp = Boolean(recorder.status && !recorder.status.offline);
+  const recording = recorder.status?.state === "recording";
+
   return (
     <div className="app">
       <header className="header">
-        <span className="brand">SUDS · episode review</span>
+        <span className="brand">SUDS</span>
+        <div className="tabs">
+          {(["live", "review"] as View[]).map((name) => (
+            <button key={name} className="tab" aria-pressed={view === name} onClick={() => setView(name)}>
+              {name === "live" ? "Live" : "Review"}
+              {name === "live" && recorderUp && <span className={`dot ${recording ? "fail" : "ok"}`} aria-hidden />}
+              {name === "review" && <span className="tab-count">{episodes.length}</span>}
+            </button>
+          ))}
+        </div>
         <select className="picker" value={repoId} onChange={(e) => setRepoId(e.target.value)}>
-          {datasets.length === 0 && <option value="">no datasets found</option>}
+          {datasets.length === 0 && <option value="">no datasets</option>}
           {datasets.map((id) => (
             <option key={id} value={id}>
               {id}
             </option>
           ))}
         </select>
+        <HealthPanel recorder={recorder} />
         <StatsStrip data={data} />
       </header>
 
       <div className="body">
+        {view === "review" && (
         <aside className="sidebar">
           <div className="filters">
-            {(["all", "unlabeled", "pass", "fail"] as Filter[]).map((f) => (
+            {(["all", "unlabeled", "pass", "fail", "discard"] as Filter[]).map((f) => (
               <button
                 key={f}
                 className="chip"
@@ -157,33 +207,57 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
               </button>
             ))}
           </div>
-          <EpisodeList episodes={visible} selected={current?.episode_index ?? -1} onSelect={setSelected} />
+          <EpisodeList
+            episodes={visible}
+            selected={current?.episode_index ?? -1}
+            onSelect={setSelected}
+            onDelete={deleteEpisode}
+          />
         </aside>
+        )}
 
         <main className="main">
-          <DaemonPanel
-            repoId={repoId}
-            videoKeys={data?.video_keys ?? []}
-            recorderOnline={Boolean(recorder.status && !recorder.status.offline)}
-            onChanged={refresh}
-          />
-          <SafetyBar recorder={recorder} />
-          <LiveCameras recorder={recorder} />
-          <RecordBar recorder={recorder} />
-          <CalibrationPanel recorder={recorder} />
-          <HealthPanel recorder={recorder} />
-          {!datasets.length && (
-            <p className="empty">
-              No LeRobot datasets under <code>{root}</code>.<br />
-              Record one, or point <code>SUDS_DATASET_ROOT</code> somewhere else.
-            </p>
-          )}
-          {error && <p className="empty">{error}</p>}
-          {current && data && (
+          {view === "live" ? (
             <>
-              <VideoPanel repoId={repoId} episode={current} videoKeys={data.video_keys} />
-              <LabelBar episode={current} onLabel={label} />
-              <TracePanel repoId={repoId} episode={current} data={data} />
+              <CommandBar recorderRunning={recorderUp} />
+              <DaemonPanel
+                repoId={repoId}
+                videoKeys={data?.video_keys ?? []}
+                recorderOnline={recorderUp}
+                onChanged={refresh}
+              />
+
+              {recorderUp && (
+                <div className="toolbar">
+                  <SafetyBar recorder={recorder} />
+                  <RecordBar recorder={recorder} />
+                </div>
+              )}
+
+              {recorderUp && <TeleopSyncPanel recorder={recorder} />}
+              {recorderUp && <LiveCameras recorder={recorder} />}
+              <CalibrationPanel recorderOnline={recorderUp} />
+              {!recorderUp && (
+                <p className="empty">
+                  Start the recorder above to see the arms and the cameras.
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              {!datasets.length && (
+                <p className="empty">
+                  No datasets under <code>{root}</code>.
+                </p>
+              )}
+              {error && <p className="empty">{error}</p>}
+              {current && data && (
+                <>
+                  <VideoPanel repoId={repoId} episode={current} videoKeys={data.video_keys} />
+                  <LabelBar episode={current} onLabel={label} />
+                  <TracePanel repoId={repoId} episode={current} data={data} />
+                </>
+              )}
             </>
           )}
         </main>
@@ -193,7 +267,7 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
 }
 
 function matches(episode: EpisodeRow, filter: Filter): boolean {
-  if (filter === "all") return true;
+  if (filter === "all") return episode.label?.verdict !== "discard";
   if (filter === "unlabeled") return episode.label === null;
   return episode.label?.verdict === filter;
 }

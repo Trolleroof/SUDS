@@ -2,141 +2,225 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { ArmPower, CameraPower, HardwarePayload, HardwareStatus } from "@/lib/api-types";
+import type { ArmPower, CameraPower, HardwarePayload } from "@/lib/api-types";
+import { useArmsConfig } from "@/lib/use-arms-config";
 import type { Recorder } from "@/lib/use-recorder";
 
-/**
- * USB + power checks for teleop, follower, and cameras.
- *
- * The recorder holds the arms open and so always has the fresher answer; the
- * standalone health daemon is the fallback for when it is not running.
- */
+const DANGEROUS_TEMP_C = 65;
+const WARN_TEMP_C = 55;
+
+/** Compact USB + power indicators with motor temperature hover telemetry. */
 export default function HealthPanel({ recorder }: { recorder: Recorder }) {
+  const { ready: armsReady } = useArmsConfig();
   const [scan, setScan] = useState<HardwarePayload | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
 
   const poll = useCallback(async () => {
     try {
       const res = await fetch("/api/health/status", { cache: "no-store" });
-      setScan(res.ok ? ((await res.json()) as HardwarePayload) : null);
+      const body = (await res.json()) as HardwarePayload & { error?: string };
+      if (body.teleop) {
+        setScan(body);
+        setScanError(null);
+        return;
+      }
+      setScan(null);
+      setScanError(body.error ?? (res.ok ? null : "health check unavailable"));
     } catch {
       setScan(null);
+      setScanError("health check unavailable");
     }
   }, []);
 
+  // Sync ports from config/arms.json and start the health daemon when nothing else holds the arms.
+  useEffect(() => {
+    if (!armsReady) return;
+    void fetch("/api/health/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    })
+      .then(() => poll())
+      .catch(() => poll());
+  }, [armsReady, poll]);
+
   useEffect(() => {
     void poll();
-    const timer = setInterval(() => void poll(), 2000);
+    const timer = setInterval(() => void poll(), 3000);
     return () => clearInterval(timer);
   }, [poll]);
 
   const live = recorder.status?.hardware;
-  const health: HardwarePayload = live?.teleop
-    ? { ...live, source: "recorder" }
-    : scan && !scan.offline
+  const recorderLive = Boolean(recorder.status && !recorder.status.offline && live?.teleop);
+  const health: HardwarePayload = recorderLive
+    ? { ...live!, source: "recorder" }
+    : scan?.teleop
       ? scan
       : {
           source: "health",
           status: "offline",
           offline: true,
-          teleop: offlineArm("teleop"),
-          follower: offlineArm("follower"),
+          teleop: offlineArm("teleop", scanError),
+          follower: offlineArm("follower", scanError),
           cameras: {},
-          ports_seen: [],
-          error: scan?.error ?? "start health_server.py to scan for power",
         };
 
   const cameras = useMemo(() => Object.values(health.cameras ?? {}), [health]);
 
+  // Check for dangerous temperatures across both arms (>= 65°C)
+  const overheatAlerts = useMemo(() => {
+    const alerts: { arm: string; motor: string; temp: number }[] = [];
+    for (const [armLabel, arm] of [
+      ["Leader", health.teleop],
+      ["Follower", health.follower],
+    ] as const) {
+      if (arm?.temperatures) {
+        for (const [motor, temp] of Object.entries(arm.temperatures)) {
+          if (temp >= DANGEROUS_TEMP_C) {
+            alerts.push({ arm: armLabel, motor, temp });
+          }
+        }
+      }
+    }
+    return alerts;
+  }, [health]);
+
   return (
-    <section className="health panel" aria-label="Power and connection">
-      <div className="health-head">
-        <h2>Power &amp; connection</h2>
-        <span className={`health-overall ${health.status}`}>
-          {STATUS_LABEL[health.status]}
-        </span>
-        <span className="hint">
-          {health.source === "recorder" ? "live · recorder" : health.mock ? "mock" : health.offline ? "offline" : "scanning"}
-        </span>
-      </div>
-      <div className="health-grid">
-        <PowerCard label="Teleop (leader)" arm={health.teleop} />
-        <PowerCard label="Follower" arm={health.follower} />
-        {cameras.length === 0 && <CameraPowerCard camera={offlineCamera("overhead")} />}
-        {cameras.map((camera) => (
-          <CameraPowerCard key={camera.name} camera={camera} />
+    <div className="power-panel-container">
+      {overheatAlerts.length > 0 && (
+        <div className="temp-danger-banner" role="alert">
+          <span className="temp-danger-icon" aria-hidden>⚠️</span>
+          <span>
+            <strong>SERVO OVERHEAT DANGER:</strong>{" "}
+            {overheatAlerts
+              .map((a) => `${a.arm} ${a.motor} (${a.temp}°C)`)
+              .join(", ")}{" "}
+            exceeded {DANGEROUS_TEMP_C}°C threshold! Stop or cut torque to prevent permanent servo damage.
+          </span>
+        </div>
+      )}
+      <div className="power-strip" aria-label="Power and connection">
+        <PowerPill label="Leader" arm={health.teleop} />
+        <PowerPill label="Follower" arm={health.follower} />
+        {cameras.map((c) => (
+          <CameraPill key={c.name} camera={c} />
         ))}
       </div>
-      {health.ports_seen && health.ports_seen.length > 0 && (
-        <p className="health-hint">
-          USB serial ports seen: {health.ports_seen.join(", ")}
-        </p>
+    </div>
+  );
+}
+
+function PowerPill({ label, arm }: { label: string; arm: ArmPower }) {
+  const [hovered, setHovered] = useState(false);
+  const title = arm.message ?? pillTitle(arm);
+
+  const temperatures = arm.temperatures ?? {};
+  const tempEntries = Object.entries(temperatures);
+  const maxTemp = arm.max_temperature ?? (tempEntries.length ? Math.max(...tempEntries.map(([, t]) => t)) : null);
+  const isDangerous = maxTemp !== null && maxTemp >= DANGEROUS_TEMP_C;
+  const isWarm = maxTemp !== null && maxTemp >= WARN_TEMP_C && !isDangerous;
+
+  const pillClass = isDangerous
+    ? "fail overheat"
+    : isWarm
+      ? "warn"
+      : arm.status;
+
+  return (
+    <div
+      className="power-pill-wrapper"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => setHovered(true)}
+      onBlur={() => setHovered(false)}
+      tabIndex={0}
+      role="region"
+      aria-label={`${label} arm power and temperature metrics`}
+    >
+      <span className={`power-pill ${pillClass}`} title={title}>
+        <span className={`dot ${isDangerous ? "fail overheat-pulse" : arm.status}`} aria-hidden />
+        {label}: {isDangerous ? `${maxTemp}°C OVERHEAT` : arm.powered ? (maxTemp !== null ? `on (${maxTemp}°C)` : "on") : arm.usb ? "no power" : "offline"}
+      </span>
+
+      {hovered && (
+        <div className="temp-hover-card" role="tooltip">
+          <div className="temp-card-head">
+            <span className="temp-card-title">{label} Arm Telemetry</span>
+            {maxTemp !== null ? (
+              <span className={`temp-badge ${isDangerous ? "danger" : isWarm ? "warn" : "ok"}`}>
+                {isDangerous ? `⚠️ ${maxTemp}°C DANGER` : isWarm ? `⚡ ${maxTemp}°C Warm` : `✓ ${maxTemp}°C Normal`}
+              </span>
+            ) : (
+              <span className="temp-badge offline">No Temp</span>
+            )}
+          </div>
+
+          <div className="temp-card-sub">
+            <span>Port: <code>{arm.port ?? "None"}</code></span>
+            <span>Motors: {arm.motors_ok}/{arm.motors_total}</span>
+          </div>
+
+          {tempEntries.length > 0 ? (
+            <div className="temp-grid">
+              <div className="temp-grid-header">
+                <span>Joint / Servo</span>
+                <span>Temperature</span>
+              </div>
+              {tempEntries.map(([joint, temp]) => {
+                const motorDanger = temp >= DANGEROUS_TEMP_C;
+                const motorWarn = temp >= WARN_TEMP_C && !motorDanger;
+                return (
+                  <div key={joint} className={`temp-row ${motorDanger ? "danger" : motorWarn ? "warn" : "ok"}`}>
+                    <span className="temp-motor-name">{joint}</span>
+                    <span className="temp-motor-val-wrap">
+                      <span className={`temp-motor-val ${motorDanger ? "danger" : motorWarn ? "warn" : "ok"}`}>
+                        {temp}°C
+                      </span>
+                      <span className="temp-bar" aria-hidden>
+                        <i
+                          style={{
+                            width: `${Math.min(100, (temp / 80) * 100)}%`,
+                            backgroundColor: motorDanger ? "var(--fail)" : motorWarn ? "var(--warn)" : "var(--pass)",
+                          }}
+                        />
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="temp-empty">
+              {arm.powered
+                ? "Sampling motor temperatures…"
+                : "Arm not powered — connect power to read temperatures."}
+            </p>
+          )}
+
+          <div className="temp-card-foot">
+            <span className="temp-legend">
+              <span className="temp-legend-item"><i className="legend-dot ok" /> &lt;55°C Normal</span>
+              <span className="temp-legend-item"><i className="legend-dot warn" /> 55–64°C Warm</span>
+              <span className="temp-legend-item"><i className="legend-dot danger" /> ≥65°C Dangerous</span>
+            </span>
+          </div>
+        </div>
       )}
-      {health.offline && (
-        <p className="health-hint">
-          Run{" "}
-          <code>
-            python scripts/health_server.py --teleop-port /dev/tty.usbmodem… --robot-port /dev/tty.usbmodem…
-          </code>{" "}
-          to check whether the arms are plugged in and powered. Use <code>--mock</code> to test the panel without
-          hardware.
-        </p>
-      )}
-    </section>
+    </div>
   );
 }
 
-function PowerCard({ label, arm }: { label: string; arm: ArmPower }) {
+function CameraPill({ camera }: { camera: CameraPower }) {
+  const title = camera.message ?? (camera.streaming ? `index ${camera.index}` : "not streaming");
   return (
-    <article className={`health-card ${arm.status}`}>
-      <header>
-        <span className={`dot ${arm.status}`} aria-hidden />
-        <strong>{label}</strong>
-      </header>
-      <ul className="power-rows">
-        <PowerRow label="USB" ok={arm.usb} okText="plugged in" badText="not plugged in" />
-        <PowerRow label="Power" ok={arm.powered} okText="motors responding" badText="no motor response" />
-      </ul>
-      <p className="health-detail">{detailForArm(arm)}</p>
-    </article>
+    <span className={`power-pill ${camera.status}`} title={title}>
+      <span className={`dot ${camera.status}`} aria-hidden />
+      {camera.name}: {camera.streaming ? "on" : camera.usb ? "no signal" : "offline"}
+    </span>
   );
 }
 
-function CameraPowerCard({ camera }: { camera: CameraPower }) {
-  return (
-    <article className={`health-card ${camera.status}`}>
-      <header>
-        <span className={`dot ${camera.status}`} aria-hidden />
-        <strong>Camera · {camera.name}</strong>
-      </header>
-      <ul className="power-rows">
-        <PowerRow label="USB" ok={camera.usb} okText="detected" badText="not detected" />
-        <PowerRow label="Video" ok={camera.streaming} okText="streaming" badText="no signal" />
-      </ul>
-      <p className="health-detail">{detailForCamera(camera)}</p>
-    </article>
-  );
-}
-
-function PowerRow({
-  label,
-  ok,
-  okText,
-  badText,
-}: {
-  label: string;
-  ok: boolean;
-  okText: string;
-  badText: string;
-}) {
-  return (
-    <li className={ok ? "on" : "off"}>
-      <span className="power-label">{label}</span>
-      <span className="power-state">{ok ? okText : badText}</span>
-    </li>
-  );
-}
-
-function offlineArm(role: string): ArmPower {
+function offlineArm(role: string, message: string | null): ArmPower {
   return {
     role,
     status: "offline",
@@ -145,31 +229,15 @@ function offlineArm(role: string): ArmPower {
     powered: false,
     motors_ok: 0,
     motors_total: 6,
+    temperatures: {},
+    max_temperature: null,
+    temperature_status: "ok",
+    message: message ?? undefined,
   };
 }
 
-function offlineCamera(name: string): CameraPower {
-  return { name, status: "offline", index: null, usb: false, streaming: false };
+function pillTitle(arm: ArmPower): string {
+  if (!arm.usb) return "Not plugged in";
+  if (!arm.powered) return "USB ok — check power brick";
+  return arm.port ?? "Powered";
 }
-
-function detailForArm(arm: ArmPower): string {
-  if (arm.message) return arm.message;
-  if (!arm.usb) return arm.port ? `${arm.port} not found` : "configure --teleop-port / --robot-port";
-  if (!arm.powered) return "USB is up but servos are not answering — check the arm power brick";
-  if (arm.motors_ok < arm.motors_total) return `${arm.motors_ok}/${arm.motors_total} motors answered`;
-  return arm.port ? `powered on ${arm.port}` : "powered";
-}
-
-function detailForCamera(camera: CameraPower): string {
-  if (camera.message) return camera.message;
-  if (!camera.usb) return camera.index != null ? `index ${camera.index} not visible` : "not configured";
-  if (!camera.streaming) return "camera is plugged in but not delivering frames";
-  return camera.index != null ? `ok at index ${camera.index}` : "ok";
-}
-
-const STATUS_LABEL: Record<HardwareStatus, string> = {
-  ok: "all powered",
-  warn: "partial",
-  fail: "check power",
-  offline: "offline",
-};

@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { isRunning as teleopProcRunning } from "./procs";
+
 /**
  * Supervises `scripts/record_server.py` so the dashboard can start and stop it
  * from buttons instead of a terminal.
@@ -18,12 +20,13 @@ export type DaemonConfig = {
   repoId: string;
   task: string;
   fps: number;
-  mock: boolean;
   robotPort: string | null;
   teleopPort: string | null;
   cameras: CameraSpec[];
   deltaLimit: number;
   autoEstop: boolean;
+  /** Hand the follower to the leader as soon as the daemon is up. */
+  engageOnStart: boolean;
   commitSeconds: number;
 };
 
@@ -78,18 +81,19 @@ export function validate(config: DaemonConfig): string | null {
   const names = config.cameras.map((c) => c.name);
   if (new Set(names).size !== names.length) return "camera names must be unique";
 
-  if (!config.mock) {
-    for (const [label, port] of [
-      ["follower", config.robotPort],
-      ["leader", config.teleopPort],
-    ] as const) {
-      if (!port) return `${label} port is required unless mock is on`;
-      // Serial devices only, and only ones that actually exist: the whole point
-      // is that a typo fails here rather than as a confusing daemon crash.
-      if (!/^\/dev\/tty\.[\w.-]+$/.test(port)) return `${label} port must be a /dev/tty.* device`;
-      if (!fs.existsSync(port)) return `${label} port ${port} is not plugged in`;
-    }
+  for (const [label, port] of [
+    ["follower", config.robotPort],
+    ["leader", config.teleopPort],
+  ] as const) {
+    if (!port) return `${label} port is required`;
+    // Serial devices only, and only ones that actually exist: the whole point
+    // is that a typo fails here rather than as a confusing daemon crash.
+    if (!/^\/dev\/tty\.[\w.-]+$/.test(port)) return `${label} port must be a /dev/tty.* device`;
+    if (!fs.existsSync(port)) return `${label} port ${port} is not plugged in`;
   }
+  // Two arms, two cables: the same port for both is a mis-click, and the daemon
+  // would otherwise open it twice and stall on the second connect.
+  if (config.robotPort === config.teleopPort) return "the leader and follower cannot be the same port";
   return null;
 }
 
@@ -108,11 +112,8 @@ export function buildArgs(config: DaemonConfig): string[] {
     String(config.deltaLimit),
   ];
   if (config.autoEstop) args.push("--auto-estop");
-  if (config.mock) {
-    args.push("--mock");
-  } else {
-    args.push("--robot-port", config.robotPort!, "--teleop-port", config.teleopPort!);
-  }
+  if (config.engageOnStart) args.push("--engage-on-start");
+  args.push("--robot-port", config.robotPort!, "--teleop-port", config.teleopPort!);
   for (const camera of config.cameras) args.push("--camera", `${camera.name}=${camera.index}`);
   return args;
 }
@@ -134,6 +135,12 @@ export function status() {
 
 export function start(config: DaemonConfig): { ok: boolean; error?: string } {
   if (isRunning()) return { ok: false, error: "the recorder is already running" };
+  // Same reason procs.ts refuses "teleop" while the recorder is up: both open
+  // the arm ports directly, and two processes on one /dev/tty.* device is
+  // what "device disconnected or multiple access on port?" actually means.
+  if (teleopProcRunning("teleop")) {
+    return { ok: false, error: "stop teleop first — it holds both arm ports" };
+  }
 
   const invalid = validate(config);
   if (invalid) return { ok: false, error: invalid };
@@ -213,6 +220,11 @@ export function serialPorts(): string[] {
  * recorder already holds fails, and on macOS can wedge it.
  */
 export function findCameras(timeoutMs = 30_000): Promise<{ index: number; name: string }[]> {
+  if (process.platform === "darwin") {
+    // Avoid scanning camera feeds on macOS to prevent OpenCV AVFoundation device locks
+    return Promise.resolve([]);
+  }
+
   const code = [
     "import json",
     "from lerobot.cameras.opencv.camera_opencv import OpenCVCamera",
@@ -244,6 +256,52 @@ export function findCameras(timeoutMs = 30_000): Promise<{ index: number; name: 
     child.on("error", () => {
       clearTimeout(timer);
       resolve([]);
+    });
+  });
+}
+
+/**
+ * Grab one frame from a camera index, as JPEG bytes.
+ *
+ * For telling index 0 from index 3 while setting up: "OpenCV Camera @ 2" says
+ * nothing about which physical camera it is, and the wrong index is the classic
+ * way to record an afternoon of the ceiling.
+ *
+ * Only valid while the daemon is stopped — it holds the devices open, and macOS
+ * will not give the same capture device to two processes.
+ */
+export function previewCamera(index: number, timeoutMs = 25_000): Promise<Buffer | null> {
+  if (!Number.isInteger(index) || index < 0 || index > 64) return Promise.resolve(null);
+
+  // Base64 on stdout: the import chatter from OpenCV and PyAV goes to stderr,
+  // but keeping the payload textual means a stray print cannot corrupt it.
+  const code = [
+    "import base64, sys, cv2",
+    "from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig",
+    `cam = OpenCVCamera(OpenCVCameraConfig(index_or_path=${index}, width=640, height=480, fps=30))`,
+    "cam.connect()",
+    "frame = cam.read()",
+    "cam.disconnect()",
+    "ok, buf = cv2.imencode('.jpg', frame[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 75])",
+    "sys.stdout.write('JPEG:' + base64.b64encode(buf.tobytes()).decode()) if ok else None",
+  ].join("\n");
+
+  return new Promise((resolve) => {
+    const child = spawn(python(), ["-c", code], { cwd: repoRoot() });
+    let out = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve(null);
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => (out += chunk.toString()));
+    child.on("exit", () => {
+      clearTimeout(timer);
+      const at = out.indexOf("JPEG:");
+      resolve(at === -1 ? null : Buffer.from(out.slice(at + 5).trim(), "base64"));
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
     });
   });
 }

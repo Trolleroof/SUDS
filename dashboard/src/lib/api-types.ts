@@ -53,6 +53,7 @@ export type TracePayload = {
 };
 
 export type HardwareStatus = "ok" | "warn" | "fail" | "offline";
+export type TemperatureStatus = "ok" | "warn" | "danger";
 
 export type ArmPower = {
   role: string;
@@ -62,6 +63,9 @@ export type ArmPower = {
   powered: boolean;
   motors_ok: number;
   motors_total: number;
+  temperatures?: Record<string, number>;
+  max_temperature?: number | null;
+  temperature_status?: TemperatureStatus;
   message?: string;
 };
 
@@ -76,7 +80,6 @@ export type CameraPower = {
 
 export type HardwarePayload = {
   source: "health" | "recorder";
-  mock?: boolean;
   status: HardwareStatus;
   teleop: ArmPower;
   follower: ArmPower;
@@ -134,6 +137,14 @@ export type CalibrationPayload = {
   can_finish: boolean;
 };
 
+/** Whether the follower is being driven by the leader, and whether it is safe to. */
+export type TeleopSync = {
+  engaged: boolean;
+  ready: boolean;
+  worst: number;
+  worst_joint: string | null;
+};
+
 export type RecorderStatus = {
   state: RecorderState;
   repo_id: string;
@@ -150,6 +161,7 @@ export type RecorderStatus = {
   estop: EstopPayload;
   delta: DeltaPayload;
   calibration: CalibrationPayload | null;
+  teleop?: TeleopSync;
   offline?: boolean;
   error?: string;
 };
@@ -165,4 +177,6 @@ export type RecorderAction =
   | "calibrate_start"
   | "calibrate_home"
   | "calibrate_finish"
-  | "calibrate_cancel";
+  | "calibrate_cancel"
+  | "engage"
+  | "disengage";

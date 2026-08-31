@@ -23,7 +23,7 @@ export default function LabelBar({
 
   return (
     <section className="panel">
-      <h2>verdict</h2>
+      <h2>Verdict</h2>
       <div className="inner label-bar">
         {(["pass", "fail", "discard"] as Verdict[]).map((v) => (
           <button
@@ -33,7 +33,6 @@ export default function LabelBar({
             onClick={() => void onLabel(v)}
           >
             {v}
-            <span className="key">{v[0]}</span>
           </button>
         ))}
 
@@ -62,8 +61,6 @@ export default function LabelBar({
             void onLabel(verdict ?? "pass", { notes: notes || null });
           }}
         />
-
-        <span className="hint">j/k move · p/f/d label</span>
       </div>
     </section>
   );

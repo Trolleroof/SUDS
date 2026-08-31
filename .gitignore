@@ -13,5 +13,12 @@ wandb/
 data/
 *.mp4
 
+# Next.js and frontend build artifacts
+.next/
+.next-build/
+node_modules/
+*.tsbuildinfo
+.env*.local
+
 # macOS
 .DS_Store

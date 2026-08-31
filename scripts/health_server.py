@@ -9,8 +9,6 @@ frame), and disconnects.
         --teleop-port /dev/tty.usbmodemXXXX --robot-port /dev/tty.usbmodemYYYY \
         --camera overhead=0 --camera wrist=1
 
-    python scripts/health_server.py --mock
-
 Dashboard: http://127.0.0.1:8612/status  (SUDS_HEALTH_URL to override)
 """
 
@@ -52,7 +50,6 @@ class PowerMonitor:
             width=self.args.width,
             height=self.args.height,
             fps=int(self.args.rate),
-            mock=self.args.mock,
         )
         payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         with self.lock:
@@ -98,11 +95,10 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--rate", type=float, default=30.0, help="Scan interval uses 1/rate seconds.")
-    parser.add_argument("--mock", action="store_true")
     args = parser.parse_args()
 
-    if not args.mock and not (args.teleop_port and args.robot_port):
-        parser.error("--teleop-port and --robot-port are required unless --mock is set")
+    if not (args.teleop_port and args.robot_port):
+        parser.error("--teleop-port and --robot-port are required")
 
     monitor = PowerMonitor(args)
     server = ThreadingHTTPServer((args.host, args.port), make_handler(monitor))

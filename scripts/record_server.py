@@ -15,10 +15,14 @@ later the loop saves them. Discarding inside that window is
 parquet rewrite and no video re-encode. Walk away and the take is kept, which is
 the safe default.
 
-Three things run alongside the recording loop:
+Four things run alongside the recording loop:
 
 *   **E-stop.** `POST /estop` cuts servo torque on both arms from the HTTP
     thread, without waiting for the control loop -- see `_kill_torque`.
+*   **Teleop engagement.** The loop starts *observing*: both arms are read and
+    the delta is published, but nothing is driven, so bringing the daemon up
+    never moves the follower. `POST /engage` hands the follower to the leader
+    once the two agree; `POST /disengage` lets go again.
 *   **Tracking delta.** Every tick compares the leader's commanded angle against
     the follower's measured angle, per joint. A large delta means the follower is
     fighting something (or is about to). With `--auto-estop` it kills the arms by
@@ -33,8 +37,6 @@ give up on the lock and write anyway.
     python scripts/record_server.py --repo-id suds/pick_sponge \
         --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
         --camera third_person=0 --camera wrist=1
-
-    python scripts/record_server.py --repo-id suds/dev --mock   # no hardware
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from power_check import aggregate_status, build_arm_power, build_camera_power, motor_probe  # noqa: E402
+from power_check import aggregate_status, build_arm_power, build_camera_power, motor_probe, motor_temperatures  # noqa: E402
 
 from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -76,6 +78,37 @@ BOUNDARY = "suds-frame"
 
 # 10 Hz: a legible commit countdown and a live delta, on an already-open socket.
 WS_PERIOD = 0.1
+DEFAULT_REST_SECONDS = 2.0
+DEFAULT_RISE_SECONDS = 1.5
+DEFAULT_SYNC_SECONDS = 1.0
+# SO-101 follower rest pose, in the project's normalized joint units. A loose,
+# settled pose -- shoulder and elbow drooped rather than curled tight, gripper
+# cracked open -- so the arm looks at rest instead of clenched when torque
+# drops. Tune these by feel on the physical arm; nothing here reads a range.
+REST_POSE = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": -20.0,
+    "elbow_flex": 65.0,
+    "wrist_flex": 50.0,
+    "wrist_roll": -35.0,
+    "gripper": 15.0,
+}
+# Cleared, centered pose the follower rises to before it starts tracking the
+# leader, so every engage starts from the same known height instead of
+# wherever the follower was left (often curled at REST_POSE). Tune by feel.
+RISE_POSE = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 10.0,
+    "elbow_flex": 30.0,
+    "wrist_flex": 0.0,
+    "wrist_roll": 0.0,
+    "gripper": 50.0,
+}
+
+
+def _ease_out_cubic(t: float) -> float:
+    """0..1 in, 0..1 out: fast start, soft arrival instead of a dead stop."""
+    return 1.0 - (1.0 - t) ** 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("recorder")
@@ -207,10 +240,13 @@ class Recorder:
         commit_seconds: float,
         flush_every: int = 1,
         *,
-        mock: bool = False,
         camera_meta: dict[str, int] | None = None,
         delta_limit: float = 25.0,
         auto_estop: bool = False,
+        engage_on_start: bool = False,
+        rest_seconds: float = DEFAULT_REST_SECONDS,
+        rise_seconds: float = DEFAULT_RISE_SECONDS,
+        sync_seconds: float = DEFAULT_SYNC_SECONDS,
         delta_grace: int = 5,
         stream_fps: float = 10.0,
         stream_quality: int = 70,
@@ -222,7 +258,6 @@ class Recorder:
         self.task = task
         self.commit_seconds = commit_seconds
         self.flush_every = max(1, flush_every)
-        self.mock = mock
         self.camera_meta = camera_meta or {}
         self._since_flush = 0
 
@@ -248,8 +283,20 @@ class Recorder:
         self.estop_at = 0.0
         self._estop_reasserted_at = 0.0
 
+        # Observing until someone asks for otherwise: on the first tick the
+        # leader is wherever it was left, and sending that straight to a cold
+        # follower is a full-speed snap across the arm's range.
+        self.engaged = False
+        # Engaging needs a measured delta, and there is none until the loop has
+        # read both arms once -- so this is a request, honoured on the first tick
+        # that has numbers to check it against.
+        self._engage_pending = engage_on_start
+
         self.delta_limit = delta_limit
         self.auto_estop = auto_estop
+        self.rest_seconds = max(0.0, rest_seconds)
+        self.rise_seconds = max(0.0, rise_seconds)
+        self.sync_seconds = max(0.0, sync_seconds)
         self.delta_grace = max(1, delta_grace)
         self._over_ticks = 0
         self._delta: dict[str, Any] = {"joints": {}, "max": 0.0, "max_joint": None, "over": False}
@@ -266,6 +313,8 @@ class Recorder:
         self._motors_probed_at = 0.0
         self._teleop_motors: dict[str, bool] = {}
         self._follower_motors: dict[str, bool] = {}
+        self._teleop_temps: dict[str, int] = {}
+        self._follower_temps: dict[str, int] = {}
         self._hardware: dict[str, Any] = {}
 
     # -- called from the HTTP thread ------------------------------------
@@ -284,6 +333,11 @@ class Recorder:
             return self.emergency_stop(payload.get("reason") or "operator")
         if name == "rearm":
             return self.rearm(force=bool(payload.get("force")))
+        # Engagement is a torque write like re-arming is, and it has the same
+        # reason not to queue: the operator is standing over the arms with a
+        # hand on them, and a button that waits on a tick reads as a dead button.
+        if name in ("engage", "disengage"):
+            return self._set_engaged(name == "engage", force=bool(payload.get("force")))
 
         done = threading.Event()
         with self.lock:
@@ -293,6 +347,11 @@ class Recorder:
                 return {"ok": False, "error": "arms are e-stopped — re-arm first"}
             if name == "task":
                 self.task = payload.get("task") or self.task
+            elif name == "record" and not self.engaged:
+                # A take whose follower was never driven is a video of one arm
+                # moving and an action stream nothing obeyed: unusable training
+                # data that looks fine until it is trained on.
+                return {"ok": False, "error": "teleop is observing — engage it before recording"}
             elif name == "record" and self.state in (IDLE, PENDING):
                 # Starting a new take commits whatever is pending, so nothing is
                 # lost by reaching for the button again straight away.
@@ -341,7 +400,11 @@ class Recorder:
             self.estop_reason = reason
             self.estop_at = time.time()
             self.state = ESTOPPED
+            # Torque is about to go; the gate follows it, so re-arming lands
+            # back in observing rather than resuming a drive nobody asked for.
+            self.engaged = False
 
+        self._rest_and_release()
         killed = self._kill_torque()
         self._estop_reasserted_at = time.time()
 
@@ -398,6 +461,63 @@ class Recorder:
         log.info("re-armed")
         return {"ok": True}
 
+    def _set_engaged(self, engaged: bool, force: bool = False) -> dict[str, Any]:
+        """Hand the follower to the leader, or take it back.
+
+        Engaging is the same hazard as re-arming -- a follower that is energised
+        while it disagrees with the leader travels to the leader's pose at full
+        speed -- so it is refused on the same delta and cleared the same way.
+        Disengaging goes the other direction and needs no guard: the arms keep
+        being read, so the delta readout stays live while the operator walks the
+        leader back to the follower by hand.
+        """
+        verb = "engage" if engaged else "disengage"
+        with self.lock:
+            if self.estop:
+                return {"ok": False, "error": f"cannot {verb} while e-stopped — re-arm first"}
+            if self.state == CALIBRATING:
+                return {"ok": False, "error": f"cannot {verb} while calibrating"}
+            if engaged != self.engaged and not engaged and self.state == RECORDING:
+                return {"ok": False, "error": "stop the take before disengaging"}
+            if engaged == self.engaged:
+                return {"ok": True, "already": True}
+            worst = self._delta.get("max", 0.0)
+            worst_joint = self._delta.get("max_joint")
+
+        if engaged and not force and worst > self.delta_limit:
+            return {
+                "ok": False,
+                "error": (
+                    f"leader and follower are {worst:.1f} apart on {worst_joint} "
+                    f"(limit {self.delta_limit:.0f}) — match them by hand, or engage anyway"
+                ),
+                "needs_force": True,
+            }
+
+        try:
+            with self.hw_lock:
+                if engaged:
+                    # `configure` is what puts torque back on; it is the same
+                    # call `rearm` leans on rather than a bare enable_torque,
+                    # because the follower's operating mode and gains have to be
+                    # right before it is asked to hold a position.
+                    self.robot.configure()
+                    self._engage_ramp()
+                else:
+                    self._rest_and_release()
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": f"could not {verb}: {err}"}
+
+        with self.lock:
+            self.engaged = engaged
+            self.last_message = (
+                "teleop engaged — the follower is tracking the leader"
+                if engaged
+                else "teleop observing — follower torque off"
+            )
+        log.info("teleop %sd", verb)
+        return {"ok": True}
+
     def _kill_torque(self) -> list[str]:
         # Torque off outranks a clean serial transaction: if the loop will not
         # hand over the bus quickly, write anyway and accept a garbled packet
@@ -420,6 +540,65 @@ class Recorder:
         finally:
             if acquired:
                 self.hw_lock.release()
+
+    def _ramp_to(self, pose: dict[str, float], seconds: float) -> None:
+        """Ease the follower from wherever it reads now onto `pose`.
+
+        Eased rather than linear so the arm decelerates into the target instead
+        of travelling at a constant rate and stopping dead -- the difference
+        between settling into a pose and being switched off mid-motion. Caller
+        holds `hw_lock`.
+        """
+        observation = self.robot.get_observation()
+        current = {
+            key: float(value)
+            for key, value in observation.items()
+            if key.endswith(".pos") and isinstance(value, (int, float, np.number))
+        }
+        if not current:
+            return
+        target = {key: pose.get(key.removesuffix(".pos"), value) for key, value in current.items()}
+        steps = max(1, round(self.fps * seconds))
+        for step in range(1, steps + 1):
+            fraction = _ease_out_cubic(step / steps)
+            self.robot.send_action({
+                key: value + fraction * (target[key] - value)
+                for key, value in current.items()
+            })
+            if step < steps:
+                time.sleep(1.0 / self.fps)
+
+    def _rest_and_release(self) -> None:
+        """Ease the follower into the relaxed pose, then leave both arms unpowered."""
+        try:
+            with self.hw_lock:
+                self.robot.configure()
+                self._ramp_to(REST_POSE, self.rest_seconds)
+        except Exception as err:  # noqa: BLE001
+            log.warning("could not move the follower to neutral: %s", err)
+        finally:
+            with self.lock:
+                self.engaged = False
+            self._kill_torque()
+
+    def _engage_ramp(self) -> None:
+        """Rise to a known pose, then ease onto the leader before live tracking.
+
+        A bare `configure()` leaves the very next tick driving the follower
+        straight to whatever the leader currently reads -- a full-speed snap if
+        the two disagree by anywhere close to `delta_limit`. Rising first means
+        every engage starts from the same height instead of cutting through the
+        workspace from a curled rest pose, and syncing is its own eased ramp
+        rather than the first raw teleop tick.
+        """
+        self._ramp_to(RISE_POSE, self.rise_seconds)
+        leader_action = self.teleop.get_action()
+        leader_pose = {
+            key.removesuffix(".pos"): float(value)
+            for key, value in leader_action.items()
+            if key.endswith(".pos") and isinstance(value, (int, float, np.number))
+        }
+        self._ramp_to(leader_pose, self.sync_seconds)
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -444,6 +623,15 @@ class Recorder:
                     "auto": self.auto_estop,
                 },
                 "delta": dict(self._delta),
+                "teleop": {
+                    "engaged": self.engaged,
+                    # Same number the delta panel already shows, restated as the
+                    # yes/no the Engage button needs. A delta with no joints in
+                    # it is not "aligned", it is "not measured yet".
+                    "ready": bool(self._delta.get("joints")) and self._delta.get("max", 0.0) <= self.delta_limit,
+                    "worst": self._delta.get("max", 0.0),
+                    "worst_joint": self._delta.get("max_joint"),
+                },
                 "calibration": self._calibration_status,
             }
 
@@ -475,6 +663,8 @@ class Recorder:
             observation = self._calibration_sample()
         else:
             observation, sent = self._teleop()
+            if self._engage_pending:
+                self._engage_on_start()
 
         with self.lock:
             state = self.state
@@ -498,13 +688,50 @@ class Recorder:
         self._update_hardware(observation)
         self._publish_frames(observation)
 
-    def _teleop(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        with self.hw_lock:
-            observation = self.robot.get_observation()
-            action = self.teleop.get_action()
-            sent = self.robot.send_action(action)
+    def _teleop(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Read both arms every tick; drive the follower only once engaged.
+
+        Observing costs exactly the same two bus transactions, which is the
+        point: the delta the operator is lining the arms up against is measured
+        by the same code that will drive them a moment later.
+
+        A dropped USB packet here must not take the daemon down with it -- the
+        control loop's own `while True` only catches Ctrl-C, so anything else
+        that escapes `step()` kills the process and both arms disconnect as a
+        side effect, which reads exactly like a stop that nobody pressed. Log
+        it and pick the read back up next tick instead.
+        """
+        try:
+            with self.hw_lock:
+                observation = self.robot.get_observation()
+                action = self.teleop.get_action()
+                sent = self.robot.send_action(action) if self.engaged else None
+        except Exception as err:  # noqa: BLE001
+            log.warning("teleop read/write failed, skipping this tick: %s", err)
+            return None, None
         self._update_delta(action, observation)
         return observation, sent
+
+    def _engage_on_start(self) -> None:
+        """Apply --engage-on-start, once there is a delta to gate it on.
+
+        Still gated: starting the daemon must not make a follower that is
+        nowhere near its leader snap across its range, and the whole reason
+        engagement is a separate step is that it is the moment that can happen.
+        A refusal leaves teleop observing and says so, rather than failing
+        silently and looking like a dead flag.
+        """
+        with self.lock:
+            measured = bool(self._delta.get("joints"))
+        if not measured:
+            return
+        self._engage_pending = False
+
+        result = self._set_engaged(True)
+        if not result.get("ok"):
+            with self.lock:
+                self.last_message = f"stayed observing — {result.get('error')}"
+            log.warning("--engage-on-start refused: %s", result.get("error"))
 
     def _estop_hold(self) -> dict[str, Any] | None:
         """Keep reading -- and keep re-cutting torque -- while stopped.
@@ -572,6 +799,7 @@ class Recorder:
             self._begin()
         elif command == "stop":
             self._pend()
+            self._rest_and_release()
         elif command == "discard":
             self._discard()
         elif command == "save":
@@ -794,13 +1022,17 @@ class Recorder:
 
         if now - self._motors_probed_at >= 5.0 and self.state not in (CALIBRATING,):
             self._motors_probed_at = now
-            for attr, arm in (("_teleop_motors", self.teleop), ("_follower_motors", self.robot)):
+            for attr_probe, attr_temp, arm in (
+                ("_teleop_motors", "_teleop_temps", self.teleop),
+                ("_follower_motors", "_follower_temps", self.robot),
+            ):
                 bus = getattr(arm, "bus", None)
                 if bus is None:
                     continue
                 try:
                     with self.hw_lock:
-                        setattr(self, attr, motor_probe(bus))
+                        setattr(self, attr_probe, motor_probe(bus))
+                        setattr(self, attr_temp, motor_temperatures(bus))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -816,6 +1048,7 @@ class Recorder:
             powered=getattr(self.teleop, "is_connected", False) and teleop_ok > 0,
             motors_ok=teleop_ok,
             motors_total=len(self._teleop_motors) or 6,
+            temperatures=self._teleop_temps,
             message="torque cut by the e-stop" if self.estop else None,
         )
         follower = build_arm_power(
@@ -825,6 +1058,7 @@ class Recorder:
             powered=getattr(self.robot, "is_connected", False) and follower_ok > 0,
             motors_ok=follower_ok,
             motors_total=len(self._follower_motors) or 6,
+            temperatures=self._follower_temps,
             message="torque cut by the e-stop" if self.estop else None,
         )
 
@@ -845,7 +1079,6 @@ class Recorder:
         with self.lock:
             self._hardware = {
                 "source": "recorder",
-                "mock": self.mock,
                 "status": "fail" if self.estop else overall,
                 "teleop": teleop,
                 "follower": follower,
@@ -1088,6 +1321,8 @@ COMMANDS = {
     "task",
     "estop",
     "rearm",
+    "engage",
+    "disengage",
     "calibrate_start",
     "calibrate_home",
     "calibrate_finish",
@@ -1097,14 +1332,6 @@ COMMANDS = {
 
 def build_hardware(args):
     camera_meta = {spec.split("=", 1)[0]: int(spec.split("=", 1)[1]) for spec in args.camera}
-
-    if args.mock:
-        camera_meta = camera_meta or {"third_person": 0, "wrist": 1}
-        return (
-            MockArm(args.fps, "follower", camera_meta),
-            MockArm(args.fps, "leader", {}),
-            camera_meta,
-        )
 
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
@@ -1118,157 +1345,6 @@ def build_hardware(args):
     robot = SO101Follower(SO101FollowerConfig(port=args.robot_port, id=args.robot_id, cameras=cameras))
     teleop = SO101Leader(SO101LeaderConfig(port=args.teleop_port, id=args.teleop_id))
     return robot, teleop, camera_meta
-
-
-class MockCamera:
-    """A moving blob, so the live view has something to show with no hardware."""
-
-    H, W = 240, 320
-
-    def __init__(self, name: str, index: int, tint: tuple[int, int, int]):
-        self.name = name
-        self.index = index
-        self.tint = tint
-        self.t = 0.0
-
-    def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
-        self.t += 0.033
-        img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-        img[:, :, 2] = np.linspace(20, 90, self.W, dtype=np.uint8)[None, :]
-        x = int((0.5 + 0.45 * np.sin(self.t + self.index)) * (self.W - 40))
-        y = int((0.5 + 0.35 * np.cos(0.8 * self.t)) * (self.H - 40))
-        img[y : y + 40, x : x + 40] = self.tint
-        return img
-
-    read = read_latest
-
-    @property
-    def is_connected(self) -> bool:
-        return True
-
-    def connect(self):
-        pass
-
-    def disconnect(self):
-        pass
-
-
-class MockBus:
-    """Enough of `FeetechMotorsBus` for the power panel and the calibration
-    wizard to be exercised with nothing plugged in."""
-
-    MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-
-    def __init__(self, port: str):
-        self.port = port
-        self.motors = {name: type("M", (), {"id": i + 1})() for i, name in enumerate(self.MOTORS)}
-        self.torque = True
-        self.t = 0.0
-
-    def ping(self, name, num_retry: int = 0):
-        return 1
-
-    def disable_torque(self, motors=None, num_retry: int = 0):
-        self.torque = False
-
-    def enable_torque(self, motors=None, num_retry: int = 0):
-        self.torque = True
-
-    def write(self, *_args, **_kwargs):
-        pass
-
-    def write_calibration(self, calibration, cache: bool = True):
-        pass
-
-    def set_half_turn_homings(self, motors=None):
-        return dict.fromkeys(self.MOTORS, 0)
-
-    def sync_read(self, _data_name, motors=None, *, normalize=True, num_retry: int = 0):
-        self.t += 0.05
-        names = list(motors) if motors else self.MOTORS
-        return {name: int(2047 + 900 * np.sin(self.t + i)) for i, name in enumerate(names)}
-
-
-class MockArm:
-    """Stand-in that produces a plausible trajectory, so the whole record →
-    dashboard loop can be exercised with no arms plugged in."""
-
-    JOINTS = [
-        "shoulder_pan.pos",
-        "shoulder_lift.pos",
-        "elbow_flex.pos",
-        "wrist_flex.pos",
-        "wrist_roll.pos",
-        "gripper.pos",
-    ]
-    TINTS = [(240, 120, 40), (80, 200, 160), (200, 90, 220)]
-
-    def __init__(self, fps: int, role: str = "follower", camera_meta: dict[str, int] | None = None):
-        self.fps = fps
-        self.role = role
-        # Wall clock, not a per-call counter: the leader is only ever asked for
-        # actions and the follower only for observations, so a counter each
-        # advanced at its own rate would drift them apart and read as a fault.
-        self.t0 = time.perf_counter()
-        self.bus = MockBus(f"/dev/mock-{role}")
-        self.calibration: dict[str, Any] = {}
-        self.calibration_fpath = Path(f"~/.cache/mock-{role}.json")
-        self.cameras = {
-            name: MockCamera(name, index, self.TINTS[i % len(self.TINTS)])
-            for i, (name, index) in enumerate((camera_meta or {}).items())
-        }
-        # Follower lag, so the leader/follower delta on screen is not a flat zero.
-        # Kept small enough that the mock sits comfortably under --delta-limit.
-        self.lag = 0.05 if role == "follower" else 0.0
-
-    @property
-    def is_connected(self) -> bool:
-        return True
-
-    @property
-    def observation_features(self):
-        return {
-            **dict.fromkeys(self.JOINTS, float),
-            **{name: (MockCamera.H, MockCamera.W, 3) for name in self.cameras},
-        }
-
-    @property
-    def action_features(self):
-        return dict.fromkeys(self.JOINTS, float)
-
-    def connect(self, calibrate: bool = True):
-        pass
-
-    def disconnect(self):
-        pass
-
-    def configure(self):
-        self.bus.enable_torque()
-
-    def _save_calibration(self, fpath=None):
-        pass
-
-    def get_observation(self):
-        now = time.perf_counter() - self.t0
-        return {**self._joints(now - self.lag), **{n: c.read_latest() for n, c in self.cameras.items()}}
-
-    def get_action(self):
-        return self._joints(time.perf_counter() - self.t0)
-
-    def send_action(self, action):
-        return action
-
-    def _joints(self, u: float):
-        return {
-            "shoulder_pan.pos": 30 * np.sin(u),
-            "shoulder_lift.pos": -20 + 25 * np.sin(0.7 * u),
-            "elbow_flex.pos": 40 * np.sin(0.5 * u),
-            "wrist_flex.pos": 15 * np.cos(u),
-            "wrist_roll.pos": 10 * np.sin(2 * u),
-            # Continuous rather than a square wave: a step of 100 between two
-            # ticks would read as a tracking fault every time it flipped.
-            "gripper.pos": 50 + 45 * np.sin(0.4 * u),
-        }
 
 
 def main() -> int:
@@ -1323,13 +1399,36 @@ def main() -> int:
         default=5,
         help="Consecutive ticks over the limit before --auto-estop fires.",
     )
+    parser.add_argument(
+        "--engage-on-start",
+        action="store_true",
+        help="Hand the follower to the leader as soon as the arms are read, instead of starting in "
+        "observing mode. Still refused if the two are further apart than --delta-limit.",
+    )
+    parser.add_argument(
+        "--rest-seconds",
+        type=float,
+        default=DEFAULT_REST_SECONDS,
+        help="Seconds used to ease the follower to the relaxed pose before torque is released.",
+    )
+    parser.add_argument(
+        "--rise-seconds",
+        type=float,
+        default=DEFAULT_RISE_SECONDS,
+        help="Seconds used to raise the follower to RISE_POSE at the start of an engage.",
+    )
+    parser.add_argument(
+        "--sync-seconds",
+        type=float,
+        default=DEFAULT_SYNC_SECONDS,
+        help="Seconds used to ease from RISE_POSE onto the leader's live pose before tracking begins.",
+    )
     parser.add_argument("--stream-fps", type=float, default=10.0, help="Rate of the browser camera streams.")
     parser.add_argument("--stream-quality", type=int, default=70, help="JPEG quality of the camera streams.")
-    parser.add_argument("--mock", action="store_true", help="Synthesize data; no hardware needed.")
     args = parser.parse_args()
 
-    if not args.mock and not (args.robot_port and args.teleop_port):
-        parser.error("--robot-port and --teleop-port are required unless --mock is set")
+    if not (args.robot_port and args.teleop_port):
+        parser.error("--robot-port and --teleop-port are required")
 
     robot, teleop, camera_meta = build_hardware(args)
     robot.connect()
@@ -1383,10 +1482,13 @@ def main() -> int:
         args.task,
         args.commit_seconds,
         args.flush_every,
-        mock=args.mock,
         camera_meta=camera_meta,
         delta_limit=args.delta_limit,
         auto_estop=args.auto_estop,
+        engage_on_start=args.engage_on_start,
+        rest_seconds=args.rest_seconds,
+        rise_seconds=args.rise_seconds,
+        sync_seconds=args.sync_seconds,
         delta_grace=args.delta_grace,
         stream_fps=args.stream_fps,
         stream_quality=args.stream_quality,
@@ -1413,6 +1515,7 @@ def main() -> int:
         recorder.dataset.finalize()
     finally:
         server.shutdown()
+        recorder._rest_and_release()
         robot.disconnect()
         teleop.disconnect()
     return 0

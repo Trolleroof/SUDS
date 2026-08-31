@@ -18,12 +18,22 @@ const ACTIONS = new Set([
   "calibrate_home",
   "calibrate_finish",
   "calibrate_cancel",
+  "engage",
+  "disengage",
 ]);
 
 type Params = { params: Promise<{ action: string }> };
 
 export async function GET(_request: Request, { params }: Params) {
-  return proxy((await params).action, "GET");
+  const action = (await params).action;
+
+  // The browser opens the daemon's websocket directly -- Next's app router
+  // cannot proxy an upgrade -- so it has to be told where that is, since
+  // SUDS_RECORDER_URL is only visible on the server.
+  if (action === "wsurl") {
+    return NextResponse.json({ url: `${RECORDER.replace(/^http/, "ws")}/ws` });
+  }
+  return proxy(action, "GET");
 }
 
 export async function POST(request: Request, { params }: Params) {

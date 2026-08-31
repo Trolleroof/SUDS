@@ -89,6 +89,7 @@ export default function SafetyBar({ recorder }: { recorder: Recorder }) {
         )}
       </div>
 
+      {(estop.engaged || delta?.over) && (
       <div className="delta-grid">
         {joints.length === 0 && <span className="hint">no joint readings yet</span>}
         {joints.map(([name, joint]) => (
@@ -104,6 +105,7 @@ export default function SafetyBar({ recorder }: { recorder: Recorder }) {
           </article>
         ))}
       </div>
+      )}
     </section>
   );
 }

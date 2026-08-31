@@ -107,6 +107,25 @@ meshes; it is also the URDF source LeRobot's own `lerobot-find-joint-limits`
 points at. The MJCF joint names match LeRobot's motor names 1:1 and in order,
 so no remapping is needed.
 
+### Build the cell clone before generating data
+
+SUDS uses MuJoCo to test whether simulated data reduces the number of real
+demonstrations needed to fine-tune GROOT. Start from the supplied SO-101 scene;
+do not make a second robot model. Add a tray, dish holder, dish, and the
+overhead camera, all measured from the physical cell.
+
+1. Fix an AprilTag/checkerboard to the tray and one coordinate marker to the
+   robot base. Measure the tray, holder, dish, and markers.
+2. Park the physical arm at its recorded rest pose and capture an overhead
+   image. Adjust the MuJoCo camera until the rendered markers and dish align.
+3. Replay a few recorded trajectories in the twin and compare their rendered
+   videos to the real clips. Tune only pose offsets, actuator response, and
+   contact friction; randomize the remaining uncertainty.
+
+Keep the real camera feature name unchanged (`observation.images.overhead` for
+`suds/live`). Train on randomized sim variants, but evaluate every claim on
+unseen physical trials. The full study protocol is in `idea.md`.
+
 ### mjpython + uv Python: libpython3.12.dylib not loaded
 
 MuJoCo's interactive viewer must run under `mjpython` on macOS. Out of the box
@@ -166,7 +185,6 @@ normal path:
 python scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
     --camera third_person=0 --camera wrist=1
-python scripts/record_server.py --repo-id suds/dev --mock   # no hardware
 ```
 
 Space starts and stops a take, backspace throws it away, enter commits it early —

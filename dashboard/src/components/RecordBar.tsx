@@ -46,10 +46,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
     return (
       <section className="panel recorder">
         <div className="inner label-bar">
-          <span className="hint">
-            recorder offline — start it with{" "}
-            <code>python scripts/record_server.py --repo-id &lt;id&gt; --mock</code>
-          </span>
+          <span className="hint">recorder offline — start it from Setup above</span>
         </div>
       </section>
     );
@@ -74,6 +71,33 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
 
   const state = status.state;
 
+  // Record is refused while teleop is observing, because a take whose follower
+  // was never driven is unusable data. Rather than only saying so after the
+  // press, offer the fix in the same place as the button it blocks.
+  if (state === "idle" && status.teleop && !status.teleop.engaged) {
+    return (
+      <section className="panel recorder">
+        <div className="inner label-bar">
+          <button
+            className="record-btn idle"
+            tabIndex={-1}
+            disabled={busy || !status.teleop.ready}
+            onClick={() => void send("engage")}
+          >
+            <span className="glyph">▶</span>
+            Engage teleop
+          </button>
+          <span className="readout">
+            {status.teleop.ready
+              ? "the follower is not being driven yet"
+              : `arms ${status.teleop.worst.toFixed(1)} apart on ${status.teleop.worst_joint} — line them up first`}
+          </span>
+          <span className="hint">recording needs the follower tracking the leader</span>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className={`panel recorder ${state}`}>
       <div className="inner label-bar">
@@ -90,17 +114,16 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
         >
           <span className="glyph">{GLYPH[state]}</span>
           {LABEL[state]}
-          <span className="key">{KEY_HINT[state]}</span>
         </button>
 
         {state === "pending" && (
           <button className="verdict pass" tabIndex={-1} disabled={busy} onClick={() => void send("save")}>
-            Save now <span className="key">⏎</span>
+            Save now
           </button>
         )}
         {(state === "recording" || state === "pending") && (
           <button className="verdict danger" tabIndex={-1} disabled={busy} onClick={() => void send("discard")}>
-            Delete take <span className="key">⌫</span>
+            Delete
           </button>
         )}
 
@@ -123,10 +146,6 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
             <div style={{ width: `${100 * (1 - status.commit_in_s / status.commit_seconds)}%` }} />
           </div>
         )}
-
-        <span className="hint">
-          {status.repo_id} · {status.saved_episodes} saved · {status.fps} fps · “{status.task}”
-        </span>
       </div>
     </section>
   );
@@ -157,15 +176,6 @@ const LABEL: Record<RecorderState, string> = {
   saving: "Encoding…",
   calibrating: "Calibrating",
   estopped: "Stopped",
-};
-
-const KEY_HINT: Record<RecorderState, string> = {
-  idle: "space",
-  recording: "space",
-  pending: "space",
-  saving: "",
-  calibrating: "",
-  estopped: "",
 };
 
 const GLYPH: Record<RecorderState, string> = {

@@ -20,9 +20,11 @@ So this app is a read-only view over the dataset plus one small sidecar file it
 writes: the verdicts.
 
 Because `lerobot-record --policy.path=...` writes rollouts in the *same* format,
-pointing the picker at the eval dataset gives you autonomous success rate with
-no extra work. Demo pass rate and rollout pass rate side by side is the number
-that says whether the pipeline works.
+pointing the picker at the held-out physical eval dataset gives you autonomous
+success rate with no extra work. For SUDS, compare that rate across frozen real
+demo budgets (5/10/20/40) for real-only and sim+real GROOT fine-tuning. Keep
+simulated data out of this picker: the claim is reduced *physical* data need,
+not simulated success.
 
 ## Power & connection
 
@@ -34,13 +36,57 @@ a frame). It does not measure teleop quality — just "is there power?"
 python scripts/health_server.py \
     --teleop-port /dev/tty.usbmodemXXXX --robot-port /dev/tty.usbmodemYYYY \
     --camera overhead=0 --camera wrist=1
-
-python scripts/health_server.py --mock   # no hardware
 ```
 
 The daemon rescans every couple of seconds on `http://127.0.0.1:8612`
 (`SUDS_HEALTH_URL`). While `record_server.py` is running, the panel reads live
 power state from the recorder instead.
+
+## Two screens
+
+**Live** is what you look at with a leader arm in your hand: the daemon, the
+kill switch, the teleop sync, the cameras pointing at the cell right now, and
+the record button. **Review** is the episode screen — sidebar, recorded video,
+verdicts, traces — for afterwards, with both hands free.
+
+They are separate because sharing one scroll put a live camera directly above a
+*recording* of a camera. When the arm is moving you must never have to wonder
+whether the picture is from now.
+
+## Teleop sync
+
+The follower is not driven until you say so. Starting the daemon leaves teleop
+**observing**: both arms are read, the delta is live, nothing moves. Press
+**Engage teleop** to hand the follower over to the leader.
+
+**teleop on start** in Setup skips the manual step: the daemon engages as soon
+as it has read both arms, so Record works immediately. It is still gated on the
+delta — if the arms are too far apart it stays observing and says why, rather
+than snapping the follower on startup.
+
+This exists because engaging is the moment the follower snaps to the leader's
+pose at full speed — the same hazard the re-arm button guards. Observing shows
+you, per joint, how far and *which way* the leader has to move to meet the
+follower, so you can bring them together by hand first. Engage is refused while
+they disagree by more than the delta limit, and recording is refused while
+observing, because an episode where the follower was not tracking is garbage
+data.
+
+## Status over websocket
+
+The dashboard holds one websocket to the daemon (`ws://…:8611/ws`) and the
+daemon pushes status at 10 Hz. Every panel reads that one stream.
+
+It used to be a 4 Hz poll per panel. The request count was not really the
+problem — localhost JSON is cheap. The problem was that a poll against a daemon
+that is *not running* is a failed request every 250 ms for as long as the tab is
+open, which buries everything else in the server log. A socket that will not
+open is one failed connect and a backoff, capped at 15 s.
+
+The daemon implements the protocol itself, in about eighty lines of stdlib —
+there is no websocket library in the venv, and it only needs the narrow half:
+accept one upgrade, push text frames, notice when the client leaves. The browser
+connects to it directly, since Next's app router cannot proxy an upgrade.
 
 ## Starting the recorder
 
@@ -48,14 +94,17 @@ The top panel starts and stops `scripts/record_server.py` itself, so nothing in
 the normal loop needs a terminal. **Setup** opens the same options the script
 takes on its command line:
 
-- **mock / real arms** — mock synthesises two cameras and a moving pair of arms,
-  which is enough to exercise every control on this page with nothing plugged in.
 - **Scan hardware** — lists the USB serial ports and the camera indices OpenCV
   can see, as buttons. On macOS `/dev/tty.usbmodem*` names change between
   reboots and a wrong camera index is the classic way to lose an afternoon, so
   neither is typed in. Scanning is only offered while the recorder is stopped:
   enumerating cameras means opening them, and the recorder already has them.
 - **dataset / task / fps / commit seconds / delta limit / auto-stop**.
+- **camera previews** — each index shows a real frame on demand, because
+  "OpenCV Camera @ 2" says nothing about which physical camera it is.
+
+Setup is a dialog rather than a panel in the page: it is a thing you do once
+before a session, and it should not compete for the screen with the cameras.
 
 Camera *names* are not free choice once a dataset exists. A `LeRobotDataset` has
 a fixed schema, so a dataset recorded with `overhead` cannot accept frames
@@ -157,9 +206,6 @@ the arm, the cameras, and the dataset writer, and exposes start/stop over HTTP:
 python ../scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
     --camera third_person=0 --camera wrist=1 --task "pick up the sponge"
-
-# no arms plugged in
-python ../scripts/record_server.py --repo-id suds/dev --mock
 ```
 
 The dashboard finds it at `http://127.0.0.1:8611` (`SUDS_RECORDER_URL` to

@@ -3,6 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { CameraSpec, DaemonConfig } from "@/lib/daemon";
+import {
+  DEFAULT_ARM_PORTS,
+  readStoredSetup,
+  reconcileArmPorts,
+  resolveArmPorts,
+  shortPort,
+} from "@/lib/arm-ports";
+import { useArmsConfig } from "@/lib/use-arms-config";
 
 type DaemonStatus = {
   running: boolean;
@@ -14,6 +22,9 @@ type DaemonStatus = {
 };
 
 type Scan = { ports: string[]; cameras: { index: number; name: string }[]; scanned_cameras: boolean };
+
+/** The parts of /api/calibrate/status this panel needs: is each arm usable. */
+type CalibrationSummary = Record<"leader" | "follower", { exists: boolean; suspect: string[] }>;
 
 /**
  * Start and stop the recorder daemon from the dashboard.
@@ -42,14 +53,27 @@ export default function DaemonPanel({
   recorderOnline: boolean;
   onChanged: () => void;
 }) {
+  const { configured, ready: armsReady } = useArmsConfig();
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [scan, setScan] = useState<Scan | null>(null);
   const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [portWarning, setPortWarning] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [config, setConfig] = useState<DaemonConfig | null>(null);
+  const [calibration, setCalibration] = useState<CalibrationSummary | null>(null);
+
+  // Read once the setup dialog opens: this is the last screen before the arms
+  // are driven, so it is the right place to find out they are not calibrated.
+  useEffect(() => {
+    if (!showConfig) return;
+    void fetch("/api/calibrate/status", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => setCalibration(body?.saved ?? null))
+      .catch(() => setCalibration(null));
+  }, [showConfig]);
 
   const datasetCameras = useMemo(
     () => videoKeys.map((key) => key.replace("observation.images.", "")),
@@ -74,25 +98,34 @@ export default function DaemonPanel({
   // Seed the form from the last run if there is one, otherwise from the dataset
   // on screen — so the common case is "press Start".
   useEffect(() => {
-    if (config || !status) return;
+    if (config || !status || !armsReady) return;
+    const stored = readStoredSetup();
+    const ports = resolveArmPorts(
+      {
+        teleopPort: (stored.teleopPort as string | null) ?? null,
+        robotPort: (stored.robotPort as string | null) ?? null,
+      },
+      configured,
+    );
+    const datasetCams = (datasetCameras.length ? datasetCameras : ["third_person", "wrist"]).map((name, i) => ({
+      name,
+      index: i,
+    }));
     setConfig(
       status.config ?? {
-        repoId: repoId || "suds/dev",
-        task: "pick up the sponge",
-        fps: 30,
-        mock: true,
-        robotPort: null,
-        teleopPort: null,
-        cameras: (datasetCameras.length ? datasetCameras : ["third_person", "wrist"]).map((name, i) => ({
-          name,
-          index: i,
-        })),
-        deltaLimit: 25,
-        autoEstop: false,
-        commitSeconds: 6,
+        repoId: (stored.repoId as string) || repoId || "suds/live",
+        task: (stored.task as string) || "pick up the sponge",
+        fps: (stored.fps as number) || 30,
+        robotPort: ports.robotPort ?? DEFAULT_ARM_PORTS.robotPort,
+        teleopPort: ports.teleopPort ?? DEFAULT_ARM_PORTS.teleopPort,
+        cameras: (stored.cameras as CameraSpec[])?.length ? (stored.cameras as CameraSpec[]) : datasetCams,
+        deltaLimit: (stored.deltaLimit as number) ?? 25,
+        autoEstop: (stored.autoEstop as boolean) ?? false,
+        engageOnStart: (stored.engageOnStart as boolean) ?? true,
+        commitSeconds: (stored.commitSeconds as number) ?? 6,
       },
     );
-  }, [config, status, repoId, datasetCameras]);
+  }, [config, status, repoId, datasetCameras, armsReady, configured]);
 
   const post = useCallback(
     async (action: "start" | "stop" | "restart", body?: unknown) => {
@@ -123,19 +156,81 @@ export default function DaemonPanel({
 
   const rescan = useCallback(async () => {
     setScanning(true);
+    setPortWarning(null);
     try {
       const res = await fetch("/api/daemon/scan", { cache: "no-store" });
-      setScan((await res.json()) as Scan);
+      const body = (await res.json()) as Scan;
+      setScan(body);
+      const found = body.ports ?? [];
+      const { ports: next, changed, missing } = reconcileArmPorts(found, configured);
+      setConfig((prev) => {
+        if (!prev) return prev;
+        const merged = resolveArmPorts(
+          { teleopPort: prev.teleopPort, robotPort: prev.robotPort },
+          next,
+        );
+        return { ...prev, ...merged };
+      });
+      if (missing.length && !changed) {
+        setPortWarning(
+          `Expected ${missing.map((p) => shortPort(p)).join(", ")} not found — plug in arms or edit config/arms.json`,
+        );
+      } else if (changed) {
+        setPortWarning("USB names changed — updated from scan (edit config/arms.json to make permanent)");
+      }
     } finally {
       setScanning(false);
     }
-  }, []);
+  }, [configured]);
+
+  // Ports load from config/arms.json; rescan is manual (USB or cameras).
+
+  const detectedIndices = useMemo(
+    () => (scan?.cameras.length ? scan.cameras.map((c) => c.index) : []),
+    [scan],
+  );
+
+  const indicesForRow = useCallback(
+    (cameras: CameraSpec[], at: number) => {
+      const current = cameras[at]?.index;
+      const taken = new Set(cameras.filter((_, i) => i !== at).map((c) => c.index));
+      const pool = detectedIndices.length ? detectedIndices : [0, 1, 2, 3];
+      return pool.filter((index) => !taken.has(index) || index === current);
+    },
+    [detectedIndices],
+  );
+
+  // The quick-command buttons need the same ports and cameras this dialog picks,
+  // and they are used before the recorder has ever been started -- so the
+  // selection is remembered here rather than only reaching the server on Start.
+  useEffect(() => {
+    if (!config) return;
+    try {
+      window.localStorage.setItem("suds.setup", JSON.stringify(config));
+    } catch {
+      /* private windows refuse storage; the buttons just fall back to a scan */
+    }
+  }, [config]);
 
   if (!status || !config) return null;
 
   const patch = (fields: Partial<DaemonConfig>) => setConfig({ ...config, ...fields });
   const setCamera = (at: number, fields: Partial<CameraSpec>) =>
     patch({ cameras: config.cameras.map((camera, i) => (i === at ? { ...camera, ...fields } : camera)) });
+
+  const nextCameraIndex = () => {
+    const taken = new Set(config.cameras.map((c) => c.index));
+    const pool = detectedIndices.length ? detectedIndices : [0, 1, 2, 3];
+    return pool.find((index) => !taken.has(index)) ?? config.cameras.length;
+  };
+
+  // An arm with no calibration file is not a warning either: `robot.connect()`
+  // calibrates when it finds none, and calibrating blocks on `input()` -- so
+  // the daemon would sit there forever, silent, with the port already taken.
+  const uncalibrated = (["leader", "follower"] as const).filter((role) => calibration && !calibration[role].exists);
+  const narrow = (["leader", "follower"] as const).flatMap((role) =>
+    calibration?.[role].suspect.map((joint) => `${role} ${joint}`) ?? [],
+  );
 
   const mismatch =
     datasetCameras.length > 0 &&
@@ -168,7 +263,18 @@ export default function DaemonPanel({
             </button>
           </>
         ) : (
-          <button className="verdict pass big" disabled={busy} onClick={() => void post("start", config)}>
+          <button
+            className="verdict pass big"
+            disabled={busy}
+            onClick={() =>
+              void post(
+                "start",
+                mismatch
+                  ? { ...config, cameras: datasetCameras.map((name, i) => ({ name, index: config.cameras[i]?.index ?? i })) }
+                  : config,
+              )
+            }
+          >
             {busy ? "Starting…" : "Start recorder"}
           </button>
         )}
@@ -182,7 +288,7 @@ export default function DaemonPanel({
 
         <span className="hint">
           {status.running
-            ? `pid ${status.pid} · up ${status.uptime_s.toFixed(0)}s · ${config.mock ? "mock" : "hardware"}`
+            ? `pid ${status.pid} · up ${status.uptime_s.toFixed(0)}s`
             : external
               ? "port is in use"
               : status.exit
@@ -190,6 +296,12 @@ export default function DaemonPanel({
                 : "not started from here"}
         </span>
       </div>
+
+      {!status.running && status.exit && status.exit.code !== 0 && status.log.length > 1 && (
+        <p className="daemon-error">
+          exited ({status.exit.code}): {status.log.filter((l) => !l.startsWith("—")).slice(-1)[0]}
+        </p>
+      )}
 
       {error && (
         <p className="daemon-error">
@@ -201,88 +313,109 @@ export default function DaemonPanel({
       )}
 
       {showConfig && (
+        <div className="modal-scrim" role="dialog" aria-modal aria-label="Recorder setup" onClick={(e) => {
+          if (e.target === e.currentTarget) setShowConfig(false);
+        }}>
+        <div className="modal">
+        <div className="modal-head">
+          <h2>Recorder setup</h2>
+          <button className="chip" onClick={() => setShowConfig(false)}>
+            close
+          </button>
+        </div>
         <div className="inner daemon-config">
-          <div className="cfg-row">
-            <span className="cfg-label">source</span>
-            <button className="chip wide" aria-pressed={config.mock} onClick={() => patch({ mock: true })}>
-              mock — no hardware
-            </button>
-            <button className="chip wide" aria-pressed={!config.mock} onClick={() => patch({ mock: false })}>
-              real arms
-            </button>
-            <button className="verdict" disabled={scanning || status.running} onClick={() => void rescan()}>
-              {scanning ? "Scanning…" : "Scan hardware"}
-            </button>
-            {status.running && <span className="hint">stop the recorder to scan — it holds the cameras</span>}
+          <div className="setup-row">
+            <span className="setup-label">Hardware</span>
+            <div className="setup-fields">
+              <button className="verdict" disabled={scanning || status.running} onClick={() => void rescan()}>
+                {scanning ? "Scanning…" : "Scan hardware"}
+              </button>
+              {portWarning && <span className="hint">{portWarning}</span>}
+              {status.running && <span className="hint">Stop the recorder first — it holds the cameras.</span>}
+            </div>
           </div>
 
-          <div className="cfg-row">
-            <span className="cfg-label">dataset</span>
-            <input
-              className="notes"
-              value={config.repoId}
-              onChange={(e) => patch({ repoId: e.target.value })}
-              placeholder="namespace/name"
-            />
-            <button className="chip" disabled={!repoId} onClick={() => patch({ repoId })}>
-              use {repoId || "selected"}
-            </button>
-            <span className="cfg-label">task</span>
-            <input className="notes" value={config.task} onChange={(e) => patch({ task: e.target.value })} />
+          <div className="setup-row">
+            <span className="setup-label">Dataset</span>
+            <div className="setup-fields">
+              <input
+                className="notes setup-input"
+                value={config.repoId}
+                onChange={(e) => patch({ repoId: e.target.value })}
+                placeholder="namespace/name"
+              />
+              <button className="chip" disabled={!repoId} onClick={() => patch({ repoId })}>
+                use {repoId || "selected"}
+              </button>
+            </div>
           </div>
 
-          {!config.mock && (
-            <>
-              <PortRow
-                label="leader (teleop)"
-                ports={scan?.ports ?? []}
-                value={config.teleopPort}
-                onPick={(port) => patch({ teleopPort: port })}
-              />
-              <PortRow
-                label="follower"
-                ports={scan?.ports ?? []}
-                value={config.robotPort}
-                onPick={(port) => patch({ robotPort: port })}
-              />
-            </>
-          )}
+          <div className="setup-row">
+            <span className="setup-label">Task</span>
+            <div className="setup-fields">
+              <input className="notes setup-input wide" value={config.task} onChange={(e) => patch({ task: e.target.value })} />
+            </div>
+          </div>
 
-          <div className="cfg-row cameras">
-            <span className="cfg-label">cameras</span>
+          <PortRow
+            label="Leader"
+            ports={scan?.ports ?? []}
+            value={config.teleopPort}
+            taken={config.robotPort}
+            onPick={(port) => patch({ teleopPort: port })}
+          />
+          <PortRow
+            label="Follower"
+            ports={scan?.ports ?? []}
+            value={config.robotPort}
+            taken={config.teleopPort}
+            onPick={(port) => patch({ robotPort: port })}
+          />
+
+          <div className="setup-row setup-row-top">
+            <span className="setup-label">Cameras</span>
             <div className="camera-list">
-              {config.cameras.map((camera, at) => (
+              {config.cameras.map((camera, at) => {
+                const options = indicesForRow(config.cameras, at);
+                return (
                 <div className="camera-row" key={at}>
                   <input
-                    className="notes narrow"
+                    className="notes camera-name"
                     value={camera.name}
                     onChange={(e) => setCamera(at, { name: e.target.value })}
                   />
-                  <span className="hint">index</span>
-                  {(scan?.cameras.length ? scan.cameras.map((c) => c.index) : [0, 1, 2, 3]).map((index) => (
-                    <button
-                      key={index}
-                      className="chip"
-                      aria-pressed={camera.index === index}
-                      onClick={() => setCamera(at, { index })}
-                    >
-                      {index}
-                    </button>
-                  ))}
+                  <span className="camera-row-label">Index</span>
+                  <div className="camera-picks">
+                    {options.map((index) => (
+                      <button
+                        key={index}
+                        type="button"
+                        className={`camera-index ${camera.index === index ? "on" : ""}`}
+                        aria-pressed={camera.index === index}
+                        onClick={() => setCamera(at, { index })}
+                        title={`Use camera index ${index}`}
+                      >
+                        {index}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="camera-preview-slot">
+                    <CameraThumb index={camera.index} enabled={!status.running} auto={false} />
+                  </div>
                   <button
                     className="chip"
                     onClick={() => patch({ cameras: config.cameras.filter((_, i) => i !== at) })}
                   >
-                    remove
+                    Remove
                   </button>
                 </div>
-              ))}
-              <div className="camera-row">
+              );})}
+              <div className="camera-actions">
                 <button
                   className="verdict"
                   onClick={() =>
                     patch({
-                      cameras: [...config.cameras, { name: `camera_${config.cameras.length + 1}`, index: config.cameras.length }],
+                      cameras: [...config.cameras, { name: `camera_${config.cameras.length + 1}`, index: nextCameraIndex() }],
                     })
                   }
                 >
@@ -295,17 +428,32 @@ export default function DaemonPanel({
                       patch({ cameras: datasetCameras.map((name, i) => ({ name, index: config.cameras[i]?.index ?? i })) })
                     }
                   >
-                    match {repoId}
+                    Match {repoId}
                   </button>
                 )}
-                {scan && scan.cameras.length > 0 && (
-                  <span className="hint">
-                    detected: {scan.cameras.map((c) => `${c.index}${c.name ? ` ${c.name}` : ""}`).join(" · ")}
-                  </span>
-                )}
               </div>
+              {scan && scan.cameras.length > 0 && (
+                <p className="hint camera-detected">
+                  Detected: {scan.cameras.map((c) => `${c.index}${c.name ? ` ${c.name}` : ""}`).join(" · ")}
+                </p>
+              )}
             </div>
           </div>
+
+          {uncalibrated.length > 0 && (
+            <p className="daemon-warn">
+              The {uncalibrated.join(" and ")} {uncalibrated.length === 1 ? "has" : "have"} never been calibrated.
+              The daemon calibrates on connect, and calibrating waits on a terminal prompt it has no way to answer —
+              it would hang holding the port. Calibrate from the Calibration panel first.
+            </p>
+          )}
+          {uncalibrated.length === 0 && narrow.length > 0 && (
+            <p className="daemon-warn">
+              {narrow.join(", ")} {narrow.length === 1 ? "has" : "have"} almost no range in the saved calibration,
+              so commands to {narrow.length === 1 ? "it" : "them"} are scaled up to fill it — this is what makes a
+              follower joint swing to its limit. Recalibrate before recording.
+            </p>
+          )}
 
           {mismatch && (
             <p className="daemon-warn">
@@ -315,23 +463,81 @@ export default function DaemonPanel({
             </p>
           )}
 
-          <div className="cfg-row">
-            <span className="cfg-label">safety</span>
-            <NumberField label="delta limit" value={config.deltaLimit} onChange={(v) => patch({ deltaLimit: v })} />
-            <button
-              className="chip wide"
-              aria-pressed={config.autoEstop}
-              onClick={() => patch({ autoEstop: !config.autoEstop })}
-            >
-              auto-stop {config.autoEstop ? "on" : "off"}
-            </button>
-            <NumberField label="fps" value={config.fps} onChange={(v) => patch({ fps: v })} />
-            <NumberField
-              label="commit seconds"
-              value={config.commitSeconds}
-              onChange={(v) => patch({ commitSeconds: v })}
-            />
+          <div className="setup-row">
+            <span className="setup-label">Safety</span>
+            <div className="setup-fields setup-fields-wrap">
+              <NumberField label="Delta limit" value={config.deltaLimit} onChange={(v) => patch({ deltaLimit: v })} />
+              <button
+                className="chip wide"
+                aria-pressed={config.autoEstop}
+                onClick={() => patch({ autoEstop: !config.autoEstop })}
+              >
+                Auto-stop {config.autoEstop ? "on" : "off"}
+              </button>
+              <button
+                className="chip wide"
+                aria-pressed={config.engageOnStart}
+                onClick={() => patch({ engageOnStart: !config.engageOnStart })}
+                title="Hand the follower to the leader as soon as the daemon is up"
+              >
+                Teleop on start {config.engageOnStart ? "on" : "off"}
+              </button>
+            </div>
           </div>
+
+          <div className="setup-row">
+            <span className="setup-label">Timing</span>
+            <div className="setup-fields setup-fields-wrap">
+              <NumberField label="FPS" value={config.fps} onChange={(v) => patch({ fps: v })} />
+              <NumberField
+                label="Commit (s)"
+                value={config.commitSeconds}
+                onChange={(v) => patch({ commitSeconds: v })}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="modal-foot">
+          <span className="hint">
+            {status.running
+              ? "the recorder is already running — stop it to apply changes"
+              : uncalibrated.length
+                ? `${uncalibrated.join(" and ")} not calibrated`
+                : mismatch
+                ? `camera names do not match ${repoId}`
+                : `${config.cameras.length} camera${config.cameras.length === 1 ? "" : "s"} · ${
+                    config.engageOnStart ? "teleop engaged on start" : "teleop starts observing"
+                  }`}
+          </span>
+          <button className="verdict" onClick={() => setShowConfig(false)}>
+            Cancel
+          </button>
+          {mismatch && (
+            <button className="verdict" onClick={() => patch({ cameras: datasetCameras.map((name, i) => ({ name, index: config.cameras[i]?.index ?? i })) })}>
+              Match {repoId}
+            </button>
+          )}
+          <button
+            className="verdict pass big"
+            // A mismatch is not a warning, it is a certain failure: the daemon
+            // exits before it ever binds its port, and the dashboard is left
+            // showing "stopped" with no clue why. Block it at the button. A
+            // missing calibration is the same story with a worse ending -- the
+            // daemon hangs on a prompt instead of exiting. A *narrow* range only
+            // warns: it still runs, it just runs badly, and that is a judgement
+            // for the person holding the arm.
+            disabled={busy || status.running || mismatch || uncalibrated.length > 0}
+            onClick={async () => {
+              // Close only on success, so a refusal is read where it happened
+              // rather than behind a dialog that has just vanished.
+              if (await post("start", config)) setShowConfig(false);
+            }}
+          >
+            {busy ? "Starting…" : "Start recorder"}
+          </button>
+        </div>
+        </div>
         </div>
       )}
 
@@ -346,22 +552,34 @@ function PortRow({
   label,
   ports,
   value,
+  taken,
   onPick,
 }: {
   label: string;
   ports: string[];
   value: string | null;
+  /** The port the other arm is on, which this one cannot also be. */
+  taken: string | null;
   onPick: (port: string) => void;
 }) {
   return (
-    <div className="cfg-row">
-      <span className="cfg-label">{label}</span>
-      {ports.length === 0 && <span className="hint">press “Scan hardware” to list USB serial ports</span>}
-      {ports.map((port) => (
-        <button key={port} className="chip wide" aria-pressed={value === port} onClick={() => onPick(port)}>
-          {port.replace("/dev/", "")}
-        </button>
-      ))}
+    <div className="setup-row">
+      <span className="setup-label">{label}</span>
+      <div className="setup-fields setup-fields-wrap">
+        {ports.length === 0 && <span className="hint">Scan hardware to list USB ports.</span>}
+        {ports.map((port) => (
+          <button
+            key={port}
+            className="chip wide"
+            aria-pressed={value === port}
+            disabled={taken === port}
+            title={taken === port ? "Already assigned to the other arm" : undefined}
+            onClick={() => onPick(port)}
+          >
+            {port.replace("/dev/", "")}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -385,5 +603,58 @@ function NumberField({
         onChange={(e) => onChange(Number(e.target.value))}
       />
     </label>
+  );
+}
+
+/**
+ * One frame from a camera index, fetched on demand.
+ *
+ * "OpenCV Camera @ 2" tells you nothing about which physical camera it is, and
+ * picking the wrong index is how you record an afternoon of the ceiling. The
+ * grab spawns a short-lived Python process, so it is deliberately not automatic
+ * and not while the recorder holds the devices.
+ */
+function CameraThumb({ index, enabled, auto = false }: { index: number; enabled: boolean; auto?: boolean }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [state, setState] = useState<"idle" | "loading" | "failed">("idle");
+
+  const grab = useCallback(async () => {
+    setState("loading");
+    try {
+      const res = await fetch(`/api/daemon/preview?index=${index}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("no frame");
+      const blob = await res.blob();
+      setSrc((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return URL.createObjectURL(blob);
+      });
+      setState("idle");
+    } catch {
+      setState("failed");
+    }
+  }, [index]);
+
+  useEffect(() => {
+    setSrc((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return null;
+    });
+    setState("idle");
+    if (auto && enabled) void grab();
+  }, [index, auto, enabled, grab]);
+
+  useEffect(() => () => {
+    if (src) URL.revokeObjectURL(src);
+  }, [src]);
+
+  if (!enabled) return <span className="camera-thumb muted">Live while recording</span>;
+  if (src) {
+    /* eslint-disable-next-line @next/next/no-img-element -- blob URL from daemon preview */
+    return <img className="camera-thumb" src={src} alt={`Camera ${index}`} onClick={() => void grab()} title="Refresh preview" />;
+  }
+  return (
+    <button type="button" className="camera-thumb camera-thumb-btn" onClick={() => void grab()} disabled={state === "loading"}>
+      {state === "loading" ? "…" : state === "failed" ? "Retry" : "Preview"}
+    </button>
   );
 }

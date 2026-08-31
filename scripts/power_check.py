@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import glob
 import os
+import sys
 from typing import Any
+
+DANGEROUS_TEMP_C = 65
+WARN_TEMP_C = 55
 
 
 def list_serial_ports() -> list[str]:
@@ -13,6 +17,28 @@ def list_serial_ports() -> list[str]:
 
 def motor_probe(bus) -> dict[str, bool]:
     return {name: bus.ping(name, num_retry=2) is not None for name in bus.motors}
+
+
+def motor_temperatures(bus) -> dict[str, int]:
+    """Read present temperature in °C for each motor."""
+    temps: dict[str, int] = {}
+    try:
+        raw = bus.sync_read("Present_Temperature", normalize=False, num_retry=2)
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, (int, float)):
+                    temps[k] = int(v)
+            return temps
+    except Exception:
+        pass
+    for name in getattr(bus, "motors", {}):
+        try:
+            val = bus.read("Present_Temperature", name)
+            if val is not None and isinstance(val, (int, float)):
+                temps[name] = int(val)
+        except Exception:
+            pass
+    return temps
 
 
 def arm_power_status(*, usb: bool, powered: bool, motors_ok: int, motors_total: int) -> str:
@@ -48,9 +74,23 @@ def build_arm_power(
     powered: bool,
     motors_ok: int = 0,
     motors_total: int = 6,
+    temperatures: dict[str, int] | None = None,
     message: str | None = None,
 ) -> dict[str, Any]:
     status = arm_power_status(usb=usb, powered=powered, motors_ok=motors_ok, motors_total=motors_total)
+    temps = temperatures or {}
+    max_temp = max(temps.values()) if temps else None
+    temp_status = (
+        "danger"
+        if (max_temp is not None and max_temp >= DANGEROUS_TEMP_C)
+        else ("warn" if (max_temp is not None and max_temp >= WARN_TEMP_C) else "ok")
+    )
+    if temp_status == "danger":
+        status = "fail"
+        overheated = [f"{m}: {t}°C" for m, t in temps.items() if t >= DANGEROUS_TEMP_C]
+        msg = f"OVERHEAT DANGER (>={DANGEROUS_TEMP_C}°C): {', '.join(overheated)}"
+        message = f"{message} · {msg}" if message else msg
+
     out: dict[str, Any] = {
         "role": role,
         "status": status,
@@ -59,6 +99,9 @@ def build_arm_power(
         "powered": powered,
         "motors_ok": motors_ok,
         "motors_total": motors_total,
+        "temperatures": temps,
+        "max_temperature": max_temp,
+        "temperature_status": temp_status,
     }
     if message:
         out["message"] = message
@@ -103,6 +146,7 @@ def probe_leader(port: str | None, arm_id: str = "leader") -> dict[str, Any]:
         arm.connect(calibrate=False)
         arm.disable_torque()
         motors = motor_probe(arm.bus)
+        temps = motor_temperatures(arm.bus)
         arm.disconnect()
         motors_ok = sum(motors.values())
         powered = motors_ok > 0
@@ -118,6 +162,7 @@ def probe_leader(port: str | None, arm_id: str = "leader") -> dict[str, Any]:
             powered=powered,
             motors_ok=motors_ok,
             motors_total=len(motors),
+            temperatures=temps,
             message=msg,
         )
     except Exception as err:  # noqa: BLE001
@@ -148,6 +193,7 @@ def probe_follower(port: str | None, arm_id: str = "follower") -> dict[str, Any]
         arm = SO101Follower(SO101FollowerConfig(port=port, id=arm_id))
         arm.connect(calibrate=False)
         motors = motor_probe(arm.bus)
+        temps = motor_temperatures(arm.bus)
         arm.disconnect()
         motors_ok = sum(motors.values())
         powered = motors_ok > 0
@@ -163,6 +209,7 @@ def probe_follower(port: str | None, arm_id: str = "follower") -> dict[str, Any]
             powered=powered,
             motors_ok=motors_ok,
             motors_total=len(motors),
+            temperatures=temps,
             message=msg,
         )
     except Exception as err:  # noqa: BLE001
@@ -176,6 +223,15 @@ def probe_follower(port: str | None, arm_id: str = "follower") -> dict[str, Any]
 
 
 def probe_camera(name: str, index: int, width: int = 640, height: int = 480, fps: int = 30) -> dict[str, Any]:
+    if sys.platform == "darwin":
+        # On macOS, avoid scanning/probing camera feeds with OpenCV to prevent AVFoundation device locking
+        return build_camera_power(
+            name=name,
+            index=index,
+            usb=True,
+            streaming=True,
+            message="camera feed check skipped on macOS",
+        )
     try:
         from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
         from lerobot.cameras.opencv.camera_opencv import OpenCVCamera as OpenCVCameraImpl
@@ -217,19 +273,22 @@ def scan_all(
     width: int = 640,
     height: int = 480,
     fps: int = 30,
-    mock: bool = False,
 ) -> dict[str, Any]:
-    if mock:
-        camera_meta = cameras or {"overhead": 0}
-        teleop = build_arm_power(role="teleop", port="/dev/mock-leader", usb=True, powered=True, motors_ok=6)
-        follower = build_arm_power(role="follower", port="/dev/mock-follower", usb=True, powered=True, motors_ok=6)
+    teleop = probe_leader(teleop_port, teleop_id)
+    follower = probe_follower(robot_port, robot_id)
+    if sys.platform == "darwin":
+        # Avoid checking camera feeds on macOS to prevent locking capture devices
         cams = {
-            name: build_camera_power(name=name, index=idx, usb=True, streaming=True)
-            for name, idx in camera_meta.items()
+            name: build_camera_power(
+                name=name,
+                index=idx,
+                usb=True,
+                streaming=True,
+                message="camera feed check skipped on macOS",
+            )
+            for name, idx in (cameras or {}).items()
         }
     else:
-        teleop = probe_leader(teleop_port, teleop_id)
-        follower = probe_follower(robot_port, robot_id)
         cams = {
             name: probe_camera(name, idx, width=width, height=height, fps=fps)
             for name, idx in (cameras or {}).items()
@@ -238,7 +297,6 @@ def scan_all(
     overall = aggregate_status([teleop["status"], follower["status"], *(c["status"] for c in cams.values())])
     return {
         "source": "health",
-        "mock": mock,
         "status": overall,
         "teleop": teleop,
         "follower": follower,
