@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""Recording daemon: owns the arm, the cameras, and the dataset writer, and
-exposes start/stop/discard over HTTP so the dashboard can drive it.
+"""Recording daemon: owns the arms, the cameras, and the dataset writer, and
+exposes recording, an emergency stop, recalibration and live camera streams over
+HTTP so the dashboard can drive all of it from buttons.
 
 Why not shell out to `lerobot-record`: that script owns a terminal and takes its
-episode boundaries from keyboard listeners, which a web UI cannot reach. Driving
-the LeRobot API directly is both simpler and gives exact control over when an
-episode is committed.
+episode boundaries -- and its calibration prompts -- from keyboard listeners,
+which a web UI cannot reach. Driving the LeRobot API directly is both simpler and
+gives exact control over when an episode is committed.
 
 The interesting part is the commit window. Stopping does *not* immediately write
 the episode -- the frames sit in the writer's buffer, and `--commit-seconds`
@@ -14,11 +15,24 @@ later the loop saves them. Discarding inside that window is
 parquet rewrite and no video re-encode. Walk away and the take is kept, which is
 the safe default.
 
-Hardware is touched only from the main loop thread; HTTP handlers just set
-fields under a lock.
+Three things run alongside the recording loop:
+
+*   **E-stop.** `POST /estop` cuts servo torque on both arms from the HTTP
+    thread, without waiting for the control loop -- see `_kill_torque`.
+*   **Tracking delta.** Every tick compares the leader's commanded angle against
+    the follower's measured angle, per joint. A large delta means the follower is
+    fighting something (or is about to). With `--auto-estop` it kills the arms by
+    itself.
+*   **Calibration.** The LeRobot routine blocks on `input()`; this one is a state
+    machine stepped by the loop, so the phases are buttons in the browser.
+
+Hardware is touched under `hw_lock`: the loop holds it for a tick, HTTP handlers
+take it for the length of one command. The e-stop is the one caller allowed to
+give up on the lock and write anyway.
 
     python scripts/record_server.py --repo-id suds/pick_sponge \
-        --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY
+        --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
+        --camera third_person=0 --camera wrist=1
 
     python scripts/record_server.py --repo-id suds/dev --mock   # no hardware
 """
@@ -26,24 +40,158 @@ fields under a lock.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
+import socket
+import struct
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from power_check import aggregate_status, build_arm_power, build_camera_power, motor_probe  # noqa: E402
+
 from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.motors import MotorCalibration
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 IDLE, RECORDING, PENDING, SAVING = "idle", "recording", "pending", "saving"
+CALIBRATING, ESTOPPED = "calibrating", "estopped"
+
+# The motor whose range is a full turn and so cannot be swept by hand.
+FULL_TURN_MOTOR = "wrist_roll"
+FULL_TURN_RANGE = (0, 4095)
+
+BOUNDARY = "suds-frame"
+
+# 10 Hz: a legible commit countdown and a live delta, on an already-open socket.
+WS_PERIOD = 0.1
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("recorder")
+
+
+class Calibration:
+    """Non-interactive rewrite of `SOFollower.calibrate` / `SOLeader.calibrate`.
+
+    LeRobot's version is a straight line through two `input()` calls; the phases
+    here are the same two pauses, but they end when a button is pressed in the
+    browser instead. Between them the control loop keeps sampling raw encoder
+    counts, which is exactly what `record_ranges_of_motion` does while it waits
+    on the terminal.
+    """
+
+    HOME, RANGE = "home", "range"
+
+    def __init__(self, arm, role: str):
+        self.arm = arm
+        self.role = role
+        self.phase = self.HOME
+        self.homing_offsets: dict[str, int] = {}
+        self.mins: dict[str, int] = {}
+        self.maxes: dict[str, int] = {}
+        self.positions: dict[str, int] = {}
+        # Restored if the operator backs out, so a cancelled calibration leaves
+        # the arm exactly as usable as it was before.
+        self.previous = dict(getattr(arm, "calibration", {}) or {})
+
+    @property
+    def bus(self):
+        return self.arm.bus
+
+    @property
+    def sweep_motors(self) -> list[str]:
+        return [motor for motor in self.bus.motors if motor != FULL_TURN_MOTOR]
+
+    def begin(self) -> None:
+        """Free the joints so they can be moved by hand."""
+        from lerobot.motors.feetech import OperatingMode
+
+        self.bus.disable_torque()
+        for motor in self.bus.motors:
+            self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+
+    def set_home(self) -> None:
+        """Centre every joint's range on where it is standing right now."""
+        self.homing_offsets = self.bus.set_half_turn_homings()
+        self.positions = self.bus.sync_read("Present_Position", normalize=False, num_retry=3)
+        self.mins = dict(self.positions)
+        self.maxes = dict(self.positions)
+        self.phase = self.RANGE
+
+    def sample(self) -> None:
+        """One tick of the range sweep."""
+        if self.phase != self.RANGE:
+            return
+        positions = self.bus.sync_read("Present_Position", self.sweep_motors, normalize=False, num_retry=3)
+        self.positions = positions
+        for motor, value in positions.items():
+            self.mins[motor] = min(self.mins.get(motor, value), value)
+            self.maxes[motor] = max(self.maxes.get(motor, value), value)
+
+    def unswept(self) -> list[str]:
+        """Joints that have not actually been moved yet.
+
+        LeRobot raises on a zero-width range at the end of the sweep. Reporting
+        it up front instead lets the dashboard grey out the finish button and
+        name the joints still to move.
+        """
+        return [m for m in self.sweep_motors if self.maxes.get(m, 0) - self.mins.get(m, 0) < 2]
+
+    def finish(self) -> dict[str, MotorCalibration]:
+        mins = dict(self.mins)
+        maxes = dict(self.maxes)
+        mins[FULL_TURN_MOTOR], maxes[FULL_TURN_MOTOR] = FULL_TURN_RANGE
+
+        calibration = {
+            motor: MotorCalibration(
+                id=m.id,
+                drive_mode=0,
+                homing_offset=self.homing_offsets[motor],
+                range_min=mins[motor],
+                range_max=maxes[motor],
+            )
+            for motor, m in self.bus.motors.items()
+        }
+        self.arm.calibration = calibration
+        self.bus.write_calibration(calibration)
+        self.arm._save_calibration()
+        self.arm.configure()
+        return calibration
+
+    def cancel(self) -> None:
+        if self.previous:
+            self.arm.calibration = dict(self.previous)
+            self.bus.write_calibration(self.previous)
+        self.arm.configure()
+
+    def status(self) -> dict[str, Any]:
+        joints = {
+            motor: {
+                "pos": int(self.positions.get(motor, 0)),
+                "min": int(self.mins.get(motor, 0)),
+                "max": int(self.maxes.get(motor, 0)),
+                "swept": self.maxes.get(motor, 0) - self.mins.get(motor, 0) >= 2,
+            }
+            for motor in self.sweep_motors
+        }
+        return {
+            "arm": self.role,
+            "phase": self.phase,
+            "joints": joints,
+            "unswept": self.unswept(),
+            "can_finish": self.phase == self.RANGE and not self.unswept(),
+        }
 
 
 class Recorder:
@@ -58,6 +206,14 @@ class Recorder:
         task: str,
         commit_seconds: float,
         flush_every: int = 1,
+        *,
+        mock: bool = False,
+        camera_meta: dict[str, int] | None = None,
+        delta_limit: float = 25.0,
+        auto_estop: bool = False,
+        delta_grace: int = 5,
+        stream_fps: float = 10.0,
+        stream_quality: int = 70,
     ):
         self.robot = robot
         self.teleop = teleop
@@ -66,19 +222,51 @@ class Recorder:
         self.task = task
         self.commit_seconds = commit_seconds
         self.flush_every = max(1, flush_every)
+        self.mock = mock
+        self.camera_meta = camera_meta or {}
         self._since_flush = 0
 
         self.obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=True)
         self.action_features = hw_to_dataset_features(robot.action_features, ACTION, use_video=True)
 
         self.lock = threading.Lock()
+        # Serial buses are not reentrant and not thread-safe. Everything that
+        # talks to a bus takes this; the loop holds it for one tick at a time.
+        self.hw_lock = threading.RLock()
         self.state = IDLE
         self.frames = 0
         self.started_at = 0.0
         self.commit_at = 0.0
         self.last_message = "ready"
         self._command: str | None = None
+        self._payload: dict[str, Any] = {}
         self._command_done: threading.Event | None = None
+        self._command_result: dict[str, Any] = {}
+
+        self.estop = False
+        self.estop_reason = ""
+        self.estop_at = 0.0
+        self._estop_reasserted_at = 0.0
+
+        self.delta_limit = delta_limit
+        self.auto_estop = auto_estop
+        self.delta_grace = max(1, delta_grace)
+        self._over_ticks = 0
+        self._delta: dict[str, Any] = {"joints": {}, "max": 0.0, "max_joint": None, "over": False}
+
+        self.calib: Calibration | None = None
+
+        self._stream_period = 1.0 / max(1.0, stream_fps)
+        self._stream_quality = stream_quality
+        self._stream_at = 0.0
+        self._jpegs: dict[str, bytes] = {}
+        self._stream_cv = threading.Condition()
+        self._stream_seq = 0
+
+        self._motors_probed_at = 0.0
+        self._teleop_motors: dict[str, bool] = {}
+        self._follower_motors: dict[str, bool] = {}
+        self._hardware: dict[str, Any] = {}
 
     # -- called from the HTTP thread ------------------------------------
 
@@ -89,12 +277,22 @@ class Recorder:
         at 30 Hz that is well inside one tick. If the calls returned early, the
         second would be validated against the pre-stop state and rejected.
         """
+        payload = payload or {}
+
+        # The kill switch does not queue. Everything else does.
+        if name == "estop":
+            return self.emergency_stop(payload.get("reason") or "operator")
+        if name == "rearm":
+            return self.rearm(force=bool(payload.get("force")))
+
         done = threading.Event()
         with self.lock:
             if self._command is not None:
                 return {"ok": False, "error": "a command is already in flight"}
+            if self.estop and name != "task":
+                return {"ok": False, "error": "arms are e-stopped — re-arm first"}
             if name == "task":
-                self.task = (payload or {}).get("task") or self.task
+                self.task = payload.get("task") or self.task
             elif name == "record" and self.state in (IDLE, PENDING):
                 # Starting a new take commits whatever is pending, so nothing is
                 # lost by reaching for the button again straight away.
@@ -105,17 +303,123 @@ class Recorder:
                 self._command = "discard"
             elif name == "save" and self.state == PENDING:
                 self._command = "save"
+            elif name == "calibrate_start" and self.state == IDLE:
+                self._command = "calibrate_start"
+            elif name in ("calibrate_home", "calibrate_finish", "calibrate_cancel") and self.state == CALIBRATING:
+                self._command = name
             else:
                 return {"ok": False, "error": f"cannot {name} while {self.state}"}
             queued = self._command is not None
             if queued:
+                self._payload = payload
                 self._command_done = done
+                self._command_result = {}
 
-        # `save` and a `record` that commits a pending take both run a video
-        # encode inside the loop, so the wait has to tolerate seconds, not ticks.
-        if queued and not done.wait(timeout=30.0):
+        if not queued:
+            return {"ok": True}
+
+        # `save`, a `record` that commits a pending take, and finishing a
+        # calibration all run seconds of work inside the loop, so the wait has to
+        # tolerate seconds, not ticks.
+        if not done.wait(timeout=30.0):
             return {"ok": False, "error": f"{name} timed out"}
+        with self.lock:
+            return self._command_result or {"ok": True}
+
+    def emergency_stop(self, reason: str = "operator") -> dict[str, Any]:
+        """Cut torque on both arms now, from whatever thread asked.
+
+        Deliberately not routed through the command queue: a queued kill is only
+        as fast as the loop, and the loop can be several seconds deep in a video
+        encode. An in-flight take is dropped -- a take that ended in a kill is a
+        bad take by definition, and its frames were never written.
+        """
+        with self.lock:
+            already = self.estop
+            prior = self.state
+            self.estop = True
+            self.estop_reason = reason
+            self.estop_at = time.time()
+            self.state = ESTOPPED
+
+        killed = self._kill_torque()
+        self._estop_reasserted_at = time.time()
+
+        if prior in (RECORDING, PENDING):
+            try:
+                self.dataset.clear_episode_buffer()
+            except Exception as err:  # noqa: BLE001
+                log.warning("could not clear the episode buffer: %s", err)
+        if prior == CALIBRATING and self.calib is not None:
+            self.calib = None
+
+        with self.lock:
+            self.frames = 0
+            self.last_message = f"E-STOP · {reason} · torque off: {', '.join(killed) or 'nothing answered'}"
+        if not already:
+            log.warning("E-STOP (%s); torque cut on %s", reason, killed or "nothing")
+        return {"ok": True, "killed": killed, "already": already}
+
+    def rearm(self, force: bool = False) -> dict[str, Any]:
+        """Put torque back on the follower after an e-stop.
+
+        Refused while the arms disagree: re-energising a follower that is far
+        from the leader makes it snap to the leader's pose at full speed, which
+        is how you break a gripper (or a finger). Move them together first, or
+        pass force.
+        """
+        with self.lock:
+            if not self.estop:
+                return {"ok": False, "error": "not stopped"}
+            worst = self._delta.get("max", 0.0)
+            worst_joint = self._delta.get("max_joint")
+        if not force and worst > self.delta_limit:
+            return {
+                "ok": False,
+                "error": (
+                    f"leader and follower are {worst:.1f} apart on {worst_joint} "
+                    f"(limit {self.delta_limit:.0f}) — match them by hand, or re-arm anyway"
+                ),
+                "needs_force": True,
+            }
+
+        try:
+            with self.hw_lock:
+                self.robot.configure()
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": f"could not re-arm: {err}"}
+
+        with self.lock:
+            self.estop = False
+            self.estop_reason = ""
+            self.state = IDLE
+            self.last_message = "re-armed"
+        self._over_ticks = 0
+        log.info("re-armed")
         return {"ok": True}
+
+    def _kill_torque(self) -> list[str]:
+        # Torque off outranks a clean serial transaction: if the loop will not
+        # hand over the bus quickly, write anyway and accept a garbled packet
+        # (the retries below cover it).
+        acquired = self.hw_lock.acquire(timeout=0.5)
+        if not acquired:
+            log.warning("e-stop could not take the hardware lock in 500ms; cutting torque regardless")
+        try:
+            killed = []
+            for role, arm in (("follower", self.robot), ("teleop", self.teleop)):
+                bus = getattr(arm, "bus", None)
+                if bus is None:
+                    continue
+                try:
+                    bus.disable_torque(num_retry=3)
+                    killed.append(role)
+                except Exception as err:  # noqa: BLE001
+                    log.error("could not cut torque on %s: %s", role, err)
+            return killed
+        finally:
+            if acquired:
+                self.hw_lock.release()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -131,40 +435,52 @@ class Recorder:
                 "commit_seconds": self.commit_seconds,
                 "saved_episodes": self.dataset.meta.total_episodes,
                 "message": self.last_message,
+                "hardware": dict(self._hardware),
+                "cameras": list(self.camera_meta),
+                "estop": {
+                    "engaged": self.estop,
+                    "reason": self.estop_reason,
+                    "since_s": (now - self.estop_at) if self.estop else 0.0,
+                    "auto": self.auto_estop,
+                },
+                "delta": dict(self._delta),
+                "calibration": self._calibration_status,
             }
+
+    @property
+    def _calibration_status(self) -> dict[str, Any] | None:
+        calib = self.calib
+        return calib.status() if calib is not None else None
+
+    def jpeg(self, name: str) -> bytes | None:
+        with self._stream_cv:
+            return self._jpegs.get(name)
+
+    def wait_for_jpeg(self, name: str, seq: int, timeout: float = 5.0) -> tuple[bytes | None, int]:
+        """Block until a frame newer than `seq` exists, for the MJPEG stream."""
+        with self._stream_cv:
+            if self._stream_seq <= seq:
+                self._stream_cv.wait(timeout)
+            return self._jpegs.get(name), self._stream_seq
 
     # -- called from the control loop thread ----------------------------
 
     def step(self) -> None:
-        observation = self.robot.get_observation()
-        action = self.teleop.get_action()
-        sent = self.robot.send_action(action)
+        observation: dict[str, Any] | None = None
+        sent: dict[str, Any] | None = None
 
-        with self.lock:
-            command, self._command = self._command, None
-            done, self._command_done = self._command_done, None
-            state = self.state
-
-        if command == "record":
-            if state == PENDING:
-                self._save()
-            self._begin()
-        elif command == "stop":
-            self._pend()
-        elif command == "discard":
-            self._discard()
-        elif command == "save":
-            self._save()
-        if done is not None:
-            done.set()
+        if self.estop:
+            observation = self._estop_hold()
+        elif self.calib is not None:
+            observation = self._calibration_sample()
+        else:
+            observation, sent = self._teleop()
 
         with self.lock:
             state = self.state
-            expired = state == PENDING and time.time() >= self.commit_at
-        if expired:
-            self._save()
+        self._dispatch()
 
-        if state == RECORDING:
+        if state == RECORDING and observation is not None and sent is not None:
             frame = {
                 **build_dataset_frame(self.obs_features, observation, prefix=OBS_STR),
                 **build_dataset_frame(self.action_features, sent, prefix=ACTION),
@@ -173,6 +489,106 @@ class Recorder:
             self.dataset.add_frame(frame)
             with self.lock:
                 self.frames += 1
+
+        with self.lock:
+            expired = self.state == PENDING and time.time() >= self.commit_at
+        if expired:
+            self._save()
+
+        self._update_hardware(observation)
+        self._publish_frames(observation)
+
+    def _teleop(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        with self.hw_lock:
+            observation = self.robot.get_observation()
+            action = self.teleop.get_action()
+            sent = self.robot.send_action(action)
+        self._update_delta(action, observation)
+        return observation, sent
+
+    def _estop_hold(self) -> dict[str, Any] | None:
+        """Keep reading -- and keep re-cutting torque -- while stopped.
+
+        Reads carry on because the delta readout is what tells the operator when
+        it is safe to re-arm, and because the camera streams should not go black
+        at the moment something has just gone wrong.
+        """
+        try:
+            with self.hw_lock:
+                observation = self.robot.get_observation()
+                action = self.teleop.get_action()
+            self._update_delta(action, observation)
+        except Exception as err:  # noqa: BLE001
+            log.debug("read failed while e-stopped: %s", err)
+            observation = None
+
+        now = time.time()
+        if now - self._estop_reasserted_at >= 2.0:
+            self._estop_reasserted_at = now
+            self._kill_torque()
+        return observation
+
+    def _calibration_sample(self) -> dict[str, Any] | None:
+        calib = self.calib
+        if calib is None:
+            return None
+        try:
+            with self.hw_lock:
+                calib.sample()
+        except Exception as err:  # noqa: BLE001
+            log.debug("calibration read failed: %s", err)
+        # Normalised joint readings are meaningless mid-calibration, but the
+        # cameras still are not, so the operator can see the arm they are moving.
+        return self._camera_only_observation()
+
+    def _camera_only_observation(self) -> dict[str, Any]:
+        images: dict[str, Any] = {}
+        cameras = getattr(self.robot, "cameras", {}) or {}
+        for name, cam in cameras.items():
+            try:
+                with self.hw_lock:
+                    images[name] = cam.read_latest()
+            except Exception:  # noqa: BLE001
+                continue
+        return images
+
+    def _dispatch(self) -> None:
+        with self.lock:
+            command, self._command = self._command, None
+            payload, self._payload = self._payload, {}
+            done, self._command_done = self._command_done, None
+
+        if command is None:
+            if done is not None:
+                done.set()
+            return
+
+        result: dict[str, Any] = {"ok": True}
+        if command == "record":
+            with self.lock:
+                pending = self.state == PENDING
+            if pending:
+                self._save()
+            self._begin()
+        elif command == "stop":
+            self._pend()
+        elif command == "discard":
+            self._discard()
+        elif command == "save":
+            self._save()
+        elif command == "calibrate_start":
+            result = self._calibrate_start(payload.get("arm") or "follower")
+        elif command == "calibrate_home":
+            result = self._calibrate_home()
+        elif command == "calibrate_finish":
+            result = self._calibrate_finish()
+        elif command == "calibrate_cancel":
+            result = self._calibrate_cancel()
+
+        with self.lock:
+            self._command_result = result
+        if done is not None:
+            done.set()
 
     def _begin(self) -> None:
         with self.lock:
@@ -207,7 +623,8 @@ class Recorder:
             self.last_message = "encoding…"
         # Blocks the loop for the length of the video encode. That is deliberate:
         # the arm is not being teleoperated between takes anyway, and letting it
-        # race a second recording would corrupt the writer's buffer.
+        # race a second recording would corrupt the writer's buffer. (The e-stop
+        # is not affected -- it never waits on the loop.)
         self.dataset.save_episode()
         # `meta/episodes` is written through an open ParquetWriter whose footer
         # only lands on close, so an episode is not *readable* until the dataset
@@ -222,6 +639,300 @@ class Recorder:
             self.frames = 0
             self.last_message = f"saved episode {self.dataset.meta.total_episodes - 1} ({frames} frames)"
         log.info("saved episode %d", self.dataset.meta.total_episodes - 1)
+
+    # -- calibration ----------------------------------------------------
+
+    def _arm(self, role: str):
+        return self.teleop if role == "teleop" else self.robot
+
+    def _calibrate_start(self, role: str) -> dict[str, Any]:
+        if role not in ("teleop", "follower"):
+            return {"ok": False, "error": f"unknown arm {role!r}"}
+        arm = self._arm(role)
+        if getattr(arm, "bus", None) is None:
+            return {"ok": False, "error": f"{role} has no motor bus"}
+        calib = Calibration(arm, role)
+        try:
+            with self.hw_lock:
+                calib.begin()
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": f"could not free the joints: {err}"}
+        self.calib = calib
+        with self.lock:
+            self.state = CALIBRATING
+            self.last_message = f"calibrating {role} — move it to the middle of its range"
+        log.info("calibration started on %s", role)
+        return {"ok": True}
+
+    def _calibrate_home(self) -> dict[str, Any]:
+        calib = self.calib
+        if calib is None:
+            return {"ok": False, "error": "not calibrating"}
+        try:
+            with self.hw_lock:
+                calib.set_home()
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": f"could not set home: {err}"}
+        with self.lock:
+            self.last_message = f"calibrating {calib.role} — sweep every joint through its range"
+        return {"ok": True}
+
+    def _calibrate_finish(self) -> dict[str, Any]:
+        calib = self.calib
+        if calib is None:
+            return {"ok": False, "error": "not calibrating"}
+        if calib.phase != Calibration.RANGE:
+            return {"ok": False, "error": "set the home position first"}
+        unswept = calib.unswept()
+        if unswept:
+            return {"ok": False, "error": f"not moved yet: {', '.join(unswept)}"}
+        try:
+            with self.hw_lock:
+                calib.finish()
+        except Exception as err:  # noqa: BLE001
+            return {"ok": False, "error": f"could not write calibration: {err}"}
+        self.calib = None
+        with self.lock:
+            self.state = IDLE
+            self.last_message = f"calibrated {calib.role} → {getattr(calib.arm, 'calibration_fpath', 'motors')}"
+        log.info("calibration written for %s", calib.role)
+        return {"ok": True}
+
+    def _calibrate_cancel(self) -> dict[str, Any]:
+        calib = self.calib
+        if calib is None:
+            return {"ok": False, "error": "not calibrating"}
+        try:
+            with self.hw_lock:
+                calib.cancel()
+        except Exception as err:  # noqa: BLE001
+            log.warning("could not restore the previous calibration: %s", err)
+        self.calib = None
+        with self.lock:
+            self.state = IDLE
+            self.last_message = f"calibration of {calib.role} cancelled"
+        return {"ok": True}
+
+    # -- tracking delta -------------------------------------------------
+
+    def _update_delta(self, action: dict[str, Any] | None, observation: dict[str, Any] | None) -> None:
+        """Per-joint |leader commanded − follower measured|.
+
+        Both sides are in the same normalised units (−100..100, or 0..100 for the
+        gripper), so one limit covers every joint. A delta that stays large is
+        the follower failing to reach where it was told to go: it is jammed, is
+        pushing on something, or has lost power.
+        """
+        if not action or not observation:
+            return
+        joints: dict[str, Any] = {}
+        worst, worst_joint = 0.0, None
+        for key, commanded in action.items():
+            if not key.endswith(".pos"):
+                continue
+            measured = observation.get(key)
+            if not isinstance(measured, (int, float)) or not isinstance(commanded, (int, float)):
+                continue
+            delta = abs(float(commanded) - float(measured))
+            joints[key[: -len(".pos")]] = {
+                "leader": round(float(commanded), 2),
+                "follower": round(float(measured), 2),
+                "delta": round(delta, 2),
+            }
+            if delta > worst:
+                worst, worst_joint = delta, key[: -len(".pos")]
+
+        over = worst > self.delta_limit
+        self._over_ticks = self._over_ticks + 1 if over else 0
+        with self.lock:
+            self._delta = {
+                "joints": joints,
+                "max": round(worst, 2),
+                "max_joint": worst_joint,
+                "limit": self.delta_limit,
+                "over": over,
+                "over_ticks": self._over_ticks,
+            }
+
+        if self.auto_estop and not self.estop and self._over_ticks >= self.delta_grace:
+            self.emergency_stop(f"tracking error {worst:.1f} > {self.delta_limit:.0f} on {worst_joint}")
+
+    # -- camera streams -------------------------------------------------
+
+    def _publish_frames(self, observation: dict[str, Any] | None) -> None:
+        """Re-encode the frames the loop already grabbed, for the MJPEG streams.
+
+        Throttled to `--stream-fps`: the cameras are read at the control rate
+        either way, and JPEG-encoding two 640×480 frames 30 times a second buys
+        nothing a browser can show.
+        """
+        if not observation:
+            return
+        now = time.time()
+        if now - self._stream_at < self._stream_period:
+            return
+        self._stream_at = now
+
+        encoded: dict[str, bytes] = {}
+        for name in self.camera_meta:
+            frame = observation.get(name)
+            if isinstance(frame, np.ndarray) and frame.ndim == 3:
+                jpeg = encode_jpeg(frame, self._stream_quality)
+                if jpeg:
+                    encoded[name] = jpeg
+        if not encoded:
+            return
+        with self._stream_cv:
+            self._jpegs.update(encoded)
+            self._stream_seq += 1
+            self._stream_cv.notify_all()
+
+    # -- power panel ----------------------------------------------------
+
+    def _update_hardware(self, observation: dict[str, Any] | None) -> None:
+        now = time.time()
+
+        if now - self._motors_probed_at >= 5.0 and self.state not in (CALIBRATING,):
+            self._motors_probed_at = now
+            for attr, arm in (("_teleop_motors", self.teleop), ("_follower_motors", self.robot)):
+                bus = getattr(arm, "bus", None)
+                if bus is None:
+                    continue
+                try:
+                    with self.hw_lock:
+                        setattr(self, attr, motor_probe(bus))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        teleop_port = getattr(self.teleop, "bus", None) and self.teleop.bus.port
+        follower_port = getattr(self.robot, "bus", None) and self.robot.bus.port
+        teleop_ok = sum(self._teleop_motors.values()) if self._teleop_motors else 0
+        follower_ok = sum(self._follower_motors.values()) if self._follower_motors else 0
+
+        teleop = build_arm_power(
+            role="teleop",
+            port=teleop_port,
+            usb=getattr(self.teleop, "is_connected", False),
+            powered=getattr(self.teleop, "is_connected", False) and teleop_ok > 0,
+            motors_ok=teleop_ok,
+            motors_total=len(self._teleop_motors) or 6,
+            message="torque cut by the e-stop" if self.estop else None,
+        )
+        follower = build_arm_power(
+            role="follower",
+            port=follower_port,
+            usb=getattr(self.robot, "is_connected", False),
+            powered=getattr(self.robot, "is_connected", False) and follower_ok > 0,
+            motors_ok=follower_ok,
+            motors_total=len(self._follower_motors) or 6,
+            message="torque cut by the e-stop" if self.estop else None,
+        )
+
+        cameras: dict[str, Any] = {}
+        for name, index in self.camera_meta.items():
+            frame = (observation or {}).get(name)
+            streaming = isinstance(frame, np.ndarray) and frame.ndim == 3
+            cameras[name] = build_camera_power(
+                name=name,
+                index=index,
+                usb=getattr(self.robot, "is_connected", False),
+                streaming=streaming,
+                message=None if streaming else "no frame from camera",
+            )
+
+        overall = aggregate_status([teleop["status"], follower["status"], *(c["status"] for c in cameras.values())])
+
+        with self.lock:
+            self._hardware = {
+                "source": "recorder",
+                "mock": self.mock,
+                "status": "fail" if self.estop else overall,
+                "teleop": teleop,
+                "follower": follower,
+                "cameras": cameras,
+            }
+
+
+def encode_jpeg(frame: np.ndarray, quality: int = 70) -> bytes | None:
+    """RGB ndarray → JPEG bytes. Cameras hand back RGB; cv2 encodes BGR."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover - cv2 ships with the camera extra
+        return None
+    ok, buffer = cv2.imencode(".jpg", frame[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return buffer.tobytes() if ok else None
+
+
+# -- websocket (RFC 6455, server side only) -------------------------------
+#
+# A dependency-free implementation, because the venv has no websockets library
+# and the daemon only needs the narrow half of the protocol: accept one upgrade,
+# push text frames, notice when the client leaves. Reading is limited to
+# recognising close and ping, since nothing the browser sends here matters.
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11F"
+
+
+def ws_accept_key(key: str) -> str:
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+def ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+    """One unfragmented, unmasked frame. Servers never mask."""
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.append(126)
+        header += struct.pack("!H", length)
+    else:
+        header.append(127)
+        header += struct.pack("!Q", length)
+    return bytes(header) + payload
+
+
+def ws_read_opcode(sock: socket.socket) -> int | None:
+    """Opcode of one waiting client frame, or None if nothing is pending.
+
+    Client frames are always masked; the payload is read and dropped, since the
+    only ones that matter are close (0x8) and ping (0x9).
+    """
+    try:
+        first = sock.recv(2)
+    except (BlockingIOError, TimeoutError):
+        return None
+    except OSError:
+        return 0x8
+    if len(first) < 2:
+        return 0x8
+
+    opcode = first[0] & 0x0F
+    masked = first[1] & 0x80
+    length = first[1] & 0x7F
+    try:
+        if length == 126:
+            length = struct.unpack("!H", recv_exactly(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exactly(sock, 8))[0]
+        if masked:
+            recv_exactly(sock, 4)
+        if length:
+            recv_exactly(sock, length)
+    except OSError:
+        return 0x8
+    return opcode
+
+
+def recv_exactly(sock: socket.socket, count: int) -> bytes:
+    chunks = []
+    while count:
+        chunk = sock.recv(count)
+        if not chunk:
+            raise OSError("connection closed")
+        chunks.append(chunk)
+        count -= len(chunk)
+    return b"".join(chunks)
 
 
 def reopen(dataset: LeRobotDataset) -> LeRobotDataset:
@@ -251,10 +962,107 @@ def make_handler(recorder: Recorder):
             self.wfile.write(payload)
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path.rstrip("/") in ("", "/status"):
+            url = urlparse(self.path)
+            path = url.path.rstrip("/")
+            query = parse_qs(url.query)
+            name = (query.get("camera") or [""])[0]
+
+            if path in ("", "/status"):
                 self._reply(recorder.status())
+            elif path == "/ws":
+                self._websocket()
+            elif path == "/snapshot":
+                self._snapshot(name)
+            elif path == "/stream":
+                self._stream(name)
             else:
                 self._reply({"error": "not found"}, 404)
+
+        def _websocket(self) -> None:
+            """Push status to the dashboard until the client goes away.
+
+            Replaces a 4 Hz poll per panel. The saving is not really the request
+            count -- it is that a poll against a daemon that is not running is a
+            failed request every 250ms forever, whereas a socket that will not
+            open is one failed connect and a backoff.
+            """
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+                self._reply({"error": "expected a websocket upgrade"}, 400)
+                return
+
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", ws_accept_key(key))
+            self.end_headers()
+            self.close_connection = True
+
+            sock = self.connection
+            # Short timeout rather than non-blocking: recv is only used to notice
+            # the client leaving, and it must not stall the push cadence.
+            sock.settimeout(0.01)
+            try:
+                while True:
+                    payload = json.dumps(recorder.status()).encode()
+                    sock.settimeout(None)
+                    sock.sendall(ws_frame(payload))
+                    sock.settimeout(0.01)
+
+                    opcode = ws_read_opcode(sock)
+                    if opcode == 0x8:
+                        break
+                    if opcode == 0x9:
+                        sock.sendall(ws_frame(b"", opcode=0xA))
+                    time.sleep(WS_PERIOD)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                try:
+                    sock.settimeout(None)
+                except OSError:
+                    pass
+
+        def _snapshot(self, name: str) -> None:
+            jpeg = recorder.jpeg(name)
+            if jpeg is None:
+                self._reply({"error": f"no frames from camera {name!r}"}, 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(jpeg)
+
+        def _stream(self, name: str) -> None:
+            """MJPEG: one multipart part per frame, held open until the client
+            goes away. An <img src> renders this with no JavaScript at all."""
+            if name not in recorder.camera_meta:
+                self._reply({"error": f"unknown camera {name!r}"}, 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+            self.send_header("Cache-Control", "no-store, no-cache, private")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            seq = -1
+            try:
+                while True:
+                    jpeg, seq = recorder.wait_for_jpeg(name, seq)
+                    if jpeg is None:
+                        continue
+                    self.wfile.write(
+                        b"--" + BOUNDARY.encode() + b"\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                    )
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length") or 0)
@@ -263,7 +1071,7 @@ def make_handler(recorder: Recorder):
             except json.JSONDecodeError:
                 payload = {}
             name = self.path.strip("/").split("/")[-1]
-            if name not in {"record", "stop", "discard", "save", "task"}:
+            if name not in COMMANDS:
                 self._reply({"error": "not found"}, 404)
                 return
             result = recorder.command(name, payload)
@@ -272,26 +1080,113 @@ def make_handler(recorder: Recorder):
     return Handler
 
 
+COMMANDS = {
+    "record",
+    "stop",
+    "discard",
+    "save",
+    "task",
+    "estop",
+    "rearm",
+    "calibrate_start",
+    "calibrate_home",
+    "calibrate_finish",
+    "calibrate_cancel",
+}
+
+
 def build_hardware(args):
+    camera_meta = {spec.split("=", 1)[0]: int(spec.split("=", 1)[1]) for spec in args.camera}
+
     if args.mock:
-        return MockArm(args.fps), MockArm(args.fps)
+        camera_meta = camera_meta or {"third_person": 0, "wrist": 1}
+        return (
+            MockArm(args.fps, "follower", camera_meta),
+            MockArm(args.fps, "leader", {}),
+            camera_meta,
+        )
 
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
-    cameras = {}
-    for spec in args.camera:
-        name, index = spec.split("=", 1)
-        cameras[name] = OpenCVCameraConfig(
-            index_or_path=int(index), width=args.width, height=args.height, fps=args.fps
-        )
+    cameras = {
+        name: OpenCVCameraConfig(index_or_path=index, width=args.width, height=args.height, fps=args.fps)
+        for name, index in camera_meta.items()
+    }
 
-    robot = SO101Follower(
-        SO101FollowerConfig(port=args.robot_port, id=args.robot_id, cameras=cameras)
-    )
+    robot = SO101Follower(SO101FollowerConfig(port=args.robot_port, id=args.robot_id, cameras=cameras))
     teleop = SO101Leader(SO101LeaderConfig(port=args.teleop_port, id=args.teleop_id))
-    return robot, teleop
+    return robot, teleop, camera_meta
+
+
+class MockCamera:
+    """A moving blob, so the live view has something to show with no hardware."""
+
+    H, W = 240, 320
+
+    def __init__(self, name: str, index: int, tint: tuple[int, int, int]):
+        self.name = name
+        self.index = index
+        self.tint = tint
+        self.t = 0.0
+
+    def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
+        self.t += 0.033
+        img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        img[:, :, 2] = np.linspace(20, 90, self.W, dtype=np.uint8)[None, :]
+        x = int((0.5 + 0.45 * np.sin(self.t + self.index)) * (self.W - 40))
+        y = int((0.5 + 0.35 * np.cos(0.8 * self.t)) * (self.H - 40))
+        img[y : y + 40, x : x + 40] = self.tint
+        return img
+
+    read = read_latest
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+    def connect(self):
+        pass
+
+    def disconnect(self):
+        pass
+
+
+class MockBus:
+    """Enough of `FeetechMotorsBus` for the power panel and the calibration
+    wizard to be exercised with nothing plugged in."""
+
+    MOTORS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+
+    def __init__(self, port: str):
+        self.port = port
+        self.motors = {name: type("M", (), {"id": i + 1})() for i, name in enumerate(self.MOTORS)}
+        self.torque = True
+        self.t = 0.0
+
+    def ping(self, name, num_retry: int = 0):
+        return 1
+
+    def disable_torque(self, motors=None, num_retry: int = 0):
+        self.torque = False
+
+    def enable_torque(self, motors=None, num_retry: int = 0):
+        self.torque = True
+
+    def write(self, *_args, **_kwargs):
+        pass
+
+    def write_calibration(self, calibration, cache: bool = True):
+        pass
+
+    def set_half_turn_homings(self, motors=None):
+        return dict.fromkeys(self.MOTORS, 0)
+
+    def sync_read(self, _data_name, motors=None, *, normalize=True, num_retry: int = 0):
+        self.t += 0.05
+        names = list(motors) if motors else self.MOTORS
+        return {name: int(2047 + 900 * np.sin(self.t + i)) for i, name in enumerate(names)}
 
 
 class MockArm:
@@ -306,15 +1201,36 @@ class MockArm:
         "wrist_roll.pos",
         "gripper.pos",
     ]
-    H, W = 240, 320
+    TINTS = [(240, 120, 40), (80, 200, 160), (200, 90, 220)]
 
-    def __init__(self, fps: int):
+    def __init__(self, fps: int, role: str = "follower", camera_meta: dict[str, int] | None = None):
         self.fps = fps
-        self.t = 0.0
+        self.role = role
+        # Wall clock, not a per-call counter: the leader is only ever asked for
+        # actions and the follower only for observations, so a counter each
+        # advanced at its own rate would drift them apart and read as a fault.
+        self.t0 = time.perf_counter()
+        self.bus = MockBus(f"/dev/mock-{role}")
+        self.calibration: dict[str, Any] = {}
+        self.calibration_fpath = Path(f"~/.cache/mock-{role}.json")
+        self.cameras = {
+            name: MockCamera(name, index, self.TINTS[i % len(self.TINTS)])
+            for i, (name, index) in enumerate((camera_meta or {}).items())
+        }
+        # Follower lag, so the leader/follower delta on screen is not a flat zero.
+        # Kept small enough that the mock sits comfortably under --delta-limit.
+        self.lag = 0.05 if role == "follower" else 0.0
+
+    @property
+    def is_connected(self) -> bool:
+        return True
 
     @property
     def observation_features(self):
-        return {**dict.fromkeys(self.JOINTS, float), "overhead": (self.H, self.W, 3)}
+        return {
+            **dict.fromkeys(self.JOINTS, float),
+            **{name: (MockCamera.H, MockCamera.W, 3) for name in self.cameras},
+        }
 
     @property
     def action_features(self):
@@ -326,34 +1242,33 @@ class MockArm:
     def disconnect(self):
         pass
 
+    def configure(self):
+        self.bus.enable_torque()
+
+    def _save_calibration(self, fpath=None):
+        pass
+
     def get_observation(self):
-        self.t += 1 / self.fps
-        return {**self._joints(), "overhead": self._image()}
+        now = time.perf_counter() - self.t0
+        return {**self._joints(now - self.lag), **{n: c.read_latest() for n, c in self.cameras.items()}}
 
     def get_action(self):
-        return self._joints()
+        return self._joints(time.perf_counter() - self.t0)
 
     def send_action(self, action):
         return action
 
-    def _joints(self):
-        u = self.t
+    def _joints(self, u: float):
         return {
             "shoulder_pan.pos": 30 * np.sin(u),
             "shoulder_lift.pos": -20 + 25 * np.sin(0.7 * u),
             "elbow_flex.pos": 40 * np.sin(0.5 * u),
             "wrist_flex.pos": 15 * np.cos(u),
             "wrist_roll.pos": 10 * np.sin(2 * u),
-            "gripper.pos": 100.0 * (np.sin(0.4 * u) > 0),
+            # Continuous rather than a square wave: a step of 100 between two
+            # ticks would read as a tracking fault every time it flipped.
+            "gripper.pos": 50 + 45 * np.sin(0.4 * u),
         }
-
-    def _image(self):
-        img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
-        img[:, :, 2] = np.linspace(20, 90, self.W, dtype=np.uint8)[None, :]
-        x = int((0.5 + 0.45 * np.sin(self.t)) * (self.W - 40))
-        y = int((0.5 + 0.35 * np.cos(0.8 * self.t)) * (self.H - 40))
-        img[y : y + 40, x : x + 40] = (240, 120, 40)
-        return img
 
 
 def main() -> int:
@@ -386,17 +1301,37 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=INDEX",
-        help="Repeatable, e.g. --camera overhead=0 --camera wrist=1",
+        help="Repeatable, e.g. --camera third_person=0 --camera wrist=1",
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument(
+        "--delta-limit",
+        type=float,
+        default=25.0,
+        help="Leader/follower disagreement (normalised units) the dashboard flags as a tracking fault.",
+    )
+    parser.add_argument(
+        "--auto-estop",
+        action="store_true",
+        help="Cut torque automatically when the delta stays over the limit. Off by default: "
+        "a follower can legitimately lag the leader through a fast move.",
+    )
+    parser.add_argument(
+        "--delta-grace",
+        type=int,
+        default=5,
+        help="Consecutive ticks over the limit before --auto-estop fires.",
+    )
+    parser.add_argument("--stream-fps", type=float, default=10.0, help="Rate of the browser camera streams.")
+    parser.add_argument("--stream-quality", type=int, default=70, help="JPEG quality of the camera streams.")
     parser.add_argument("--mock", action="store_true", help="Synthesize data; no hardware needed.")
     args = parser.parse_args()
 
     if not args.mock and not (args.robot_port and args.teleop_port):
         parser.error("--robot-port and --teleop-port are required unless --mock is set")
 
-    robot, teleop = build_hardware(args)
+    robot, teleop, camera_meta = build_hardware(args)
     robot.connect()
     teleop.connect()
 
@@ -408,8 +1343,25 @@ def main() -> int:
     from lerobot.utils.constants import HF_LEROBOT_HOME
 
     if (HF_LEROBOT_HOME / args.repo_id).exists():
-        dataset = LeRobotDataset.resume(repo_id=args.repo_id)
+        # `root` is required: without it resume() would build a writer over the
+        # revision-safe Hub snapshot cache, which it refuses to do. Same reason
+        # as in reopen() -- and we always want the local directory anyway.
+        dataset = LeRobotDataset.resume(
+            repo_id=args.repo_id,
+            root=HF_LEROBOT_HOME / args.repo_id,
+            rgb_encoder=RGBEncoderConfig(vcodec="h264"),
+        )
         log.info("resuming %s at %d episodes", args.repo_id, dataset.meta.total_episodes)
+        # An existing dataset's schema is fixed. Adding frames under camera names
+        # it was not created with fails deep inside the writer, one Record press
+        # later; catching it here says which names it actually wants.
+        existing = {key.split(".")[-1] for key in dataset.meta.features if key.startswith(f"{OBS_STR}.images.")}
+        if existing != set(camera_meta):
+            parser.error(
+                f"{args.repo_id} was recorded with cameras {sorted(existing)}, but this run configures "
+                f"{sorted(camera_meta)}. Pass --camera NAME=INDEX matching the dataset, or record into a new "
+                "--repo-id."
+            )
     else:
         dataset = LeRobotDataset.create(
             repo_id=args.repo_id,
@@ -424,12 +1376,28 @@ def main() -> int:
         log.info("created %s", args.repo_id)
 
     recorder = Recorder(
-        robot, teleop, dataset, args.fps, args.task, args.commit_seconds, args.flush_every
+        robot,
+        teleop,
+        dataset,
+        args.fps,
+        args.task,
+        args.commit_seconds,
+        args.flush_every,
+        mock=args.mock,
+        camera_meta=camera_meta,
+        delta_limit=args.delta_limit,
+        auto_estop=args.auto_estop,
+        delta_grace=args.delta_grace,
+        stream_fps=args.stream_fps,
+        stream_quality=args.stream_quality,
     )
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(recorder))
+    server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("control API on http://%s:%d — ready", args.host, args.port)
+    for name, index in camera_meta.items():
+        log.info("camera %s (index %d) at http://%s:%d/stream?camera=%s", name, index, args.host, args.port, name)
 
     period = 1 / args.fps
     try:

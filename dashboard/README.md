@@ -24,6 +24,128 @@ pointing the picker at the eval dataset gives you autonomous success rate with
 no extra work. Demo pass rate and rollout pass rate side by side is the number
 that says whether the pipeline works.
 
+## Power & connection
+
+The **Power & connection** panel at the top checks whether each arm and camera is
+plugged in (USB visible) and actually powered (servos ping back / camera delivers
+a frame). It does not measure teleop quality — just "is there power?"
+
+```bash
+python scripts/health_server.py \
+    --teleop-port /dev/tty.usbmodemXXXX --robot-port /dev/tty.usbmodemYYYY \
+    --camera overhead=0 --camera wrist=1
+
+python scripts/health_server.py --mock   # no hardware
+```
+
+The daemon rescans every couple of seconds on `http://127.0.0.1:8612`
+(`SUDS_HEALTH_URL`). While `record_server.py` is running, the panel reads live
+power state from the recorder instead.
+
+## Starting the recorder
+
+The top panel starts and stops `scripts/record_server.py` itself, so nothing in
+the normal loop needs a terminal. **Setup** opens the same options the script
+takes on its command line:
+
+- **mock / real arms** — mock synthesises two cameras and a moving pair of arms,
+  which is enough to exercise every control on this page with nothing plugged in.
+- **Scan hardware** — lists the USB serial ports and the camera indices OpenCV
+  can see, as buttons. On macOS `/dev/tty.usbmodem*` names change between
+  reboots and a wrong camera index is the classic way to lose an afternoon, so
+  neither is typed in. Scanning is only offered while the recorder is stopped:
+  enumerating cameras means opening them, and the recorder already has them.
+- **dataset / task / fps / commit seconds / delta limit / auto-stop**.
+
+Camera *names* are not free choice once a dataset exists. A `LeRobotDataset` has
+a fixed schema, so a dataset recorded with `overhead` cannot accept frames
+labelled `wrist` — the panel prefills the names from the selected dataset,
+warns on a mismatch, and the daemon refuses to start rather than failing one
+Record press later. **Log** shows the daemon's own output, which is where that
+refusal (and any hardware error) is legible.
+
+**Stop** sends SIGINT rather than SIGTERM: the daemon's interrupt handler commits
+an in-flight take and finalizes the dataset, and a take is worth more than a fast
+shutdown. It escalates to SIGKILL after 20 seconds.
+
+A daemon you started in a terminal is detected but not managed — the panel says
+so and disables Start, because a second daemon would only crash on the port the
+first one holds.
+
+Config values arrive over HTTP and are validated before they reach a process:
+repo ids and camera names are pattern-matched, ports must be `/dev/tty.*` devices
+that actually exist, and arguments are passed as an argv array, never through a
+shell.
+
+## Kill switch and tracking delta
+
+The top bar is the emergency stop. **Kill arms** cuts servo torque on the
+follower *and* the leader, and it is the one control that is never disabled —
+it works while a take is recording, while an episode is encoding, while a
+calibration is half-finished, and again while it is already engaged.
+
+It does not go through the recorder's command queue. Queued commands are applied
+by the control loop, and the loop can be several seconds deep in a video encode;
+the stop writes to the buses from the request thread instead, taking the hardware
+lock if it can get it inside 500 ms and writing anyway if it cannot. A take that
+was in flight is dropped — its frames were never written to disk, and a take that
+ended in a kill is a bad take by definition.
+
+Next to it is the reason you would hit it. **delta** is, per joint,
+|leader commanded − follower measured| in the same normalised units both sides
+use. A follower trailing its leader by a unit or two through a fast move is
+normal. One sitting 30 units behind is not tracking: it is jammed, pushing on
+something, or has lost power — and the servos are heating up while it tries.
+`--delta-limit` (default 25) is where the bar turns amber; `--auto-estop` makes
+the daemon cut torque by itself once the delta stays over the limit for
+`--delta-grace` ticks (default 5). It is off by default because a fast enough
+demonstration can trip it honestly.
+
+**Re-arm follower** puts torque back. It refuses while the two arms are more
+than `--delta-limit` apart, because re-energising a follower that is far from
+its leader makes it snap to the leader's pose at full speed — match them by hand
+first, or press **Re-arm anyway** once you have read the number.
+
+The camera streams keep running the whole time the arms are dead, which is
+exactly when you want to see what happened.
+
+## Live cameras
+
+The recorder is already reading every camera at the control rate, and OpenCV
+will not hand the same device to a second process — so the live view is
+re-encoded frames from the daemon rather than a second capture. They arrive as
+MJPEG on `/api/stream/<name>`, which an `<img>` renders with no player, no codec
+negotiation and no JavaScript.
+
+Buttons pick one camera to fill the panel or show them all, freeze the view on
+the last frame, and reconnect a stream after a daemon restart. Rate and quality
+are `--stream-fps` (default 10) and `--stream-quality` (default 70); the control
+loop reads at `--fps` regardless.
+
+## Recalibration
+
+LeRobot's `calibrate()` is a straight line through two `input()` calls, which is
+why recalibrating normally means stopping everything and going back to a
+terminal. The **calibration** panel is the same routine with those two pauses
+turned into buttons:
+
+1. **Recalibrate leader** / **Recalibrate follower** — torque comes off and the
+   arm goes limp.
+2. Move it to the middle of every joint's travel, then **Set home position**.
+   That is `set_half_turn_homings()`: each joint's range is centred on where it
+   is standing.
+3. Sweep every joint through its full travel. The daemon samples raw encoder
+   counts on every control tick, and each joint ticks green as it moves, so you
+   can see what you have and have not covered. `wrist_roll` turns freely and is
+   written as the full 0–4095 turn rather than swept.
+4. **Save calibration** — greyed out until every joint has actually moved,
+   because LeRobot raises on a zero-width range at the end of the sweep. It
+   writes to the servos and to
+   `~/.cache/huggingface/lerobot/calibration/…/<id>.json`.
+
+**Cancel** puts the previous calibration back. Recording is unavailable while a
+calibration is open, and starting one is unavailable unless the recorder is idle.
+
 ## Recording from the dashboard
 
 `lerobot-record` takes its episode boundaries from terminal keyboard listeners,
@@ -34,7 +156,7 @@ the arm, the cameras, and the dataset writer, and exposes start/stop over HTTP:
 # real hardware
 python ../scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-    --camera overhead=0 --camera wrist=1 --task "pick up the sponge"
+    --camera third_person=0 --camera wrist=1 --task "pick up the sponge"
 
 # no arms plugged in
 python ../scripts/record_server.py --repo-id suds/dev --mock
@@ -54,6 +176,10 @@ arm in one hand and no attention to spare for finding a cursor.
 | `space` | start recording / stop recording |
 | `⌫` backspace | throw the current take away — during the recording *or* inside the commit window |
 | `⏎` enter | commit the take now instead of waiting the window out |
+
+Every one of these is also a button, and so is everything else the daemon can
+do: the keys are a shortcut for when both your hands are on the leader arm, not
+the only way in.
 
 The bar mirrors the state (`● Record` → `■ Stop` → `⌫ Delete take`) and is
 clickable too, but the keys are the interface.
@@ -153,7 +279,8 @@ lerobot-record --dataset.rgb_encoder.vcodec=h264 ...
 
 ```
 src/lib/       paths, parquet reader, dataset/meta parsing, labels, quality metrics
-src/app/api/   datasets, dataset, traces, label, video (byte-range mp4)
+src/app/api/   datasets, dataset, traces, label, video (byte-range mp4),
+               recorder (command proxy), health, stream (MJPEG passthrough)
 src/components/ Dashboard and its panels
 ```
 

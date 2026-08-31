@@ -3,10 +3,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { DatasetPayload, EpisodeRow, Verdict } from "@/lib/api-types";
+import { useRecorder } from "@/lib/use-recorder";
 
+import CalibrationPanel from "./CalibrationPanel";
+import DaemonPanel from "./DaemonPanel";
 import EpisodeList from "./EpisodeList";
+import HealthPanel from "./HealthPanel";
 import LabelBar from "./LabelBar";
+import LiveCameras from "./LiveCameras";
 import RecordBar from "./RecordBar";
+import SafetyBar from "./SafetyBar";
 import StatsStrip from "./StatsStrip";
 import TracePanel from "./TracePanel";
 import VideoPanel from "./VideoPanel";
@@ -43,6 +49,19 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const follow = useCallback(
+    (id: string) => {
+      if (followed) return;
+      setFollowed(true);
+      setRepoId(id);
+    },
+    [followed],
+  );
+
+  // One poll of the recorder daemon feeds the kill switch, the live cameras,
+  // the calibration wizard, the record bar and the power panel.
+  const recorder = useRecorder({ onEpisodeSaved: refresh, onRepoId: follow });
 
   const episodes = data?.episodes ?? [];
   const visible = useMemo(() => episodes.filter((e) => matches(e, filter)), [episodes, filter]);
@@ -142,14 +161,17 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
         </aside>
 
         <main className="main">
-          <RecordBar
-            onEpisodeSaved={refresh}
-            onRepoId={(id) => {
-              if (followed) return;
-              setFollowed(true);
-              setRepoId(id);
-            }}
+          <DaemonPanel
+            repoId={repoId}
+            videoKeys={data?.video_keys ?? []}
+            recorderOnline={Boolean(recorder.status && !recorder.status.offline)}
+            onChanged={refresh}
           />
+          <SafetyBar recorder={recorder} />
+          <LiveCameras recorder={recorder} />
+          <RecordBar recorder={recorder} />
+          <CalibrationPanel recorder={recorder} />
+          <HealthPanel recorder={recorder} />
           {!datasets.length && (
             <p className="empty">
               No LeRobot datasets under <code>{root}</code>.<br />

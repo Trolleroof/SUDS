@@ -156,19 +156,38 @@ against before the arms exist:
 python scripts/make_stub_dataset.py --repo-id suds/stub --episodes 8
 ```
 
-Recording is driven from the dashboard by a daemon that owns the arm and the
-dataset writer:
+Recording is driven from the dashboard by a daemon that owns the arms, the
+cameras and the dataset writer. The dashboard can start and stop it itself —
+**Setup** in the top panel scans for USB serial ports and camera indices and
+offers them as buttons — so these commands are the manual equivalent, not the
+normal path:
 
 ```bash
 python scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-    --camera overhead=0 --camera wrist=1
+    --camera third_person=0 --camera wrist=1
 python scripts/record_server.py --repo-id suds/dev --mock   # no hardware
 ```
 
-Space starts and stops a take, backspace throws it away, enter commits it early.
-Stopping holds the frames unwritten for a few seconds, so deleting a bad take is
-free.
+Space starts and stops a take, backspace throws it away, enter commits it early —
+and every one of those is a button too. Stopping holds the frames unwritten for a
+few seconds, so deleting a bad take is free.
+
+The same daemon owns three more things the dashboard drives from buttons:
+
+- **Kill arms** — cuts servo torque on both arms from the request thread, so it
+  does not wait on the control loop even mid-encode.
+- **Tracking delta** — per-joint |leader commanded − follower measured|.
+  `--delta-limit` (default 25) sets where it reads as a fault; `--auto-estop`
+  makes the daemon cut torque itself.
+- **Recalibration** — LeRobot's routine with its two `input()` prompts turned
+  into buttons, writing to the servos and to the usual calibration JSON.
+
+It also re-encodes the camera frames it is already reading as MJPEG on
+`/stream?camera=<name>`, which is what the live view shows — two cameras, the
+third-person view of the cell and the wrist camera on the arm. OpenCV will not
+hand the same device to two processes, so the stream has to come from whoever
+owns the camera.
 
 If you use `lerobot-record` directly instead, pass
 `--dataset.rgb_encoder.vcodec=h264`; LeRobot's AV1 default only plays

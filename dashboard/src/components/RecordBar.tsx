@@ -1,82 +1,30 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 
-export type RecorderStatus = {
-  state: "idle" | "recording" | "pending" | "saving";
-  repo_id: string;
-  fps: number;
-  task: string;
-  frames: number;
-  elapsed_s: number;
-  commit_in_s: number;
-  commit_seconds: number;
-  saved_episodes: number;
-  message: string;
-  offline?: boolean;
-};
+import type { RecorderState } from "@/lib/api-types";
+import type { Recorder } from "@/lib/use-recorder";
 
 /**
- * One button, three jobs.
+ * Recording controls: one primary button plus whatever else applies right now.
  *
  *   idle       ● Record          -> start a take
  *   recording  ■ Stop            -> stop; frames stay in the writer's buffer
- *   pending    ⌫ Delete take     -> drop the buffer, for `commit_seconds`
+ *   pending    ⏎ Save now / ⌫ Delete take / ● Record next
  *
  * Nothing is written to disk until the commit window closes, so deleting a bad
  * take is instant and leaves no trace -- no parquet rewrite, no re-encode. Do
  * nothing and the take is kept, which is the right default for a button you are
  * hitting between attempts with a robot arm in your other hand.
+ *
+ * Every action is a button; the keys are a shortcut for the same commands, for
+ * when both your hands are on the leader arm.
  */
-export default function RecordBar({
-  onEpisodeSaved,
-  onRepoId,
-}: {
-  onEpisodeSaved: () => void;
-  /** Reported once the daemon answers, so the picker can follow it. */
-  onRepoId: (repoId: string) => void;
-}) {
-  const [status, setStatus] = useState<RecorderStatus | null>(null);
-  const [busy, setBusy] = useState(false);
-  const savedCount = useRef<number | null>(null);
+export default function RecordBar({ recorder }: { recorder: Recorder }) {
+  const { status, busy, send } = recorder;
 
-  const poll = useCallback(async () => {
-    const res = await fetch("/api/recorder/status", { cache: "no-store" });
-    const body = await res.json();
-    setStatus(res.ok ? (body as RecorderStatus) : { ...body, offline: true });
-
-    // Refresh the episode list exactly when a take lands, not on a timer.
-    if (res.ok) {
-      const status = body as RecorderStatus;
-      onRepoId(status.repo_id);
-      if (savedCount.current !== null && status.saved_episodes > savedCount.current) onEpisodeSaved();
-      savedCount.current = status.saved_episodes;
-    }
-  }, [onEpisodeSaved, onRepoId]);
-
-  useEffect(() => {
-    void poll();
-    // 4 Hz: fast enough for a legible commit countdown, cheap enough to leave on.
-    const timer = setInterval(() => void poll(), 250);
-    return () => clearInterval(timer);
-  }, [poll]);
-
-  const send = useCallback(
-    async (action: string) => {
-      setBusy(true);
-      try {
-        await fetch(`/api/recorder/${action}`, { method: "POST" });
-        await poll();
-      } finally {
-        setBusy(false);
-      }
-    },
-    [poll],
-  );
-
-  // Start/stop is a keypress, not a click: while teleoperating you have a leader
-  // arm in one hand and no attention to spare for finding a cursor. Space is the
-  // only key that matters -- it toggles recording and nothing else.
+  // Start/stop is also a keypress: while teleoperating you have a leader arm in
+  // one hand and no attention to spare for finding a cursor.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -86,7 +34,7 @@ export default function RecordBar({
       const action = KEYS[event.key]?.(status.state);
       if (!action) return;
       event.preventDefault();
-      void send(action);
+      void send(action as "record" | "stop" | "discard" | "save");
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -107,47 +55,75 @@ export default function RecordBar({
     );
   }
 
-  const action = NEXT_ACTION[status.state];
+  // Recording is not offered while the arms are dead or the geometry is being
+  // rewritten underneath the dataset.
+  if (status.state === "estopped" || status.state === "calibrating") {
+    return (
+      <section className={`panel recorder ${status.state}`}>
+        <div className="inner label-bar">
+          <span className="readout">recording paused</span>
+          <span className="hint">
+            {status.state === "estopped"
+              ? "arms are e-stopped — re-arm to record again"
+              : "finish or cancel the calibration to record again"}
+          </span>
+        </div>
+      </section>
+    );
+  }
+
+  const state = status.state;
 
   return (
-    <section className={`panel recorder ${status.state}`}>
+    <section className={`panel recorder ${state}`}>
       <div className="inner label-bar">
         <button
-          className={`record-btn ${status.state}`}
-          disabled={busy || status.state === "saving"}
-          // Not tabbable: otherwise Space would both fire this handler and
+          className={`record-btn ${state}`}
+          disabled={busy || state === "saving"}
+          // Not tabbable: otherwise Space would both fire the key handler and
           // activate the focused button, running the command twice.
           tabIndex={-1}
-          onClick={() => action && void send(action)}
+          onClick={() => {
+            const action = PRIMARY[state];
+            if (action) void send(action);
+          }}
         >
-          <span className="glyph">{GLYPH[status.state]}</span>
-          {LABEL[status.state]}
-          <span className="key">{KEY_HINT[status.state]}</span>
+          <span className="glyph">{GLYPH[state]}</span>
+          {LABEL[state]}
+          <span className="key">{KEY_HINT[state]}</span>
         </button>
 
+        {state === "pending" && (
+          <button className="verdict pass" tabIndex={-1} disabled={busy} onClick={() => void send("save")}>
+            Save now <span className="key">⏎</span>
+          </button>
+        )}
+        {(state === "recording" || state === "pending") && (
+          <button className="verdict danger" tabIndex={-1} disabled={busy} onClick={() => void send("discard")}>
+            Delete take <span className="key">⌫</span>
+          </button>
+        )}
+
         <span className="readout">
-          {status.state === "recording" && (
+          {state === "recording" && (
             <>
               {status.elapsed_s.toFixed(1)}s · {status.frames} frames
             </>
           )}
-          {status.state === "pending" && (
+          {state === "pending" && (
             <>
               {status.frames} frames · saving in {status.commit_in_s.toFixed(1)}s
             </>
           )}
-          {status.state !== "recording" && status.state !== "pending" && status.message}
+          {state !== "recording" && state !== "pending" && status.message}
         </span>
 
-        {status.state === "pending" && (
+        {state === "pending" && (
           <div className="commit-bar" aria-hidden>
             <div style={{ width: `${100 * (1 - status.commit_in_s / status.commit_seconds)}%` }} />
           </div>
         )}
 
-        <span className="hint">
-          space record/stop · ⌫ delete take · ⏎ save now
-        </span>
         <span className="hint">
           {status.repo_id} · {status.saved_episodes} saved · {status.fps} fps · “{status.task}”
         </span>
@@ -162,36 +138,41 @@ export default function RecordBar({
  * going wrong does not have to be finished first. Enter commits early instead
  * of waiting the window out.
  */
-const KEYS: Record<string, (state: RecorderStatus["state"]) => string | null> = {
+const KEYS: Record<string, (state: RecorderState) => string | null> = {
   " ": (state) => (state === "idle" || state === "pending" ? "record" : state === "recording" ? "stop" : null),
   Backspace: (state) => (state === "recording" || state === "pending" ? "discard" : null),
   Enter: (state) => (state === "pending" ? "save" : null),
 };
 
-const NEXT_ACTION: Record<RecorderStatus["state"], string | null> = {
+const PRIMARY: Partial<Record<RecorderState, "record" | "stop">> = {
   idle: "record",
   recording: "stop",
-  pending: "discard",
-  saving: null,
+  pending: "record",
 };
 
-const LABEL: Record<RecorderStatus["state"], string> = {
+const LABEL: Record<RecorderState, string> = {
   idle: "Record",
   recording: "Stop",
-  pending: "Delete take",
+  pending: "Record next",
   saving: "Encoding…",
+  calibrating: "Calibrating",
+  estopped: "Stopped",
 };
 
-const KEY_HINT: Record<RecorderStatus["state"], string> = {
+const KEY_HINT: Record<RecorderState, string> = {
   idle: "space",
   recording: "space",
-  pending: "⌫",
+  pending: "space",
   saving: "",
+  calibrating: "",
+  estopped: "",
 };
 
-const GLYPH: Record<RecorderStatus["state"], string> = {
+const GLYPH: Record<RecorderState, string> = {
   idle: "●",
   recording: "■",
-  pending: "⌫",
+  pending: "●",
   saving: "◌",
+  calibrating: "⚙",
+  estopped: "⏻",
 };

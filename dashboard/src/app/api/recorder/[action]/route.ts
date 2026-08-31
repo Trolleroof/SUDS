@@ -5,7 +5,20 @@ export const dynamic = "force-dynamic";
 /** Where scripts/record_server.py is listening. */
 const RECORDER = process.env.SUDS_RECORDER_URL ?? "http://127.0.0.1:8611";
 
-const ACTIONS = new Set(["status", "record", "stop", "discard", "save", "task"]);
+const ACTIONS = new Set([
+  "status",
+  "record",
+  "stop",
+  "discard",
+  "save",
+  "task",
+  "estop",
+  "rearm",
+  "calibrate_start",
+  "calibrate_home",
+  "calibrate_finish",
+  "calibrate_cancel",
+]);
 
 type Params = { params: Promise<{ action: string }> };
 
