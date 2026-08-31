@@ -872,6 +872,114 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
 
 .cmd-ports { padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); }
 
+/* ---- quick-command hardware grid (arms + cameras) ------------------- */
+
+.hardware-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.hardware-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+@media (max-width: 800px) {
+  .hardware-grid { grid-template-columns: 1fr; }
+}
+
+.hardware-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.hardware-slot {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+}
+.hardware-slot.assigned { border-color: #93c5fd; background: #f8fafc; }
+.hardware-slot.found { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.hardware-slot header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.hardware-slot header strong {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.slot-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+.slot-badge.muted { color: var(--faint); font-style: italic; font-family: var(--sans); }
+
+.hardware-slot-warn {
+  margin: -4px 0 0;
+  font-size: 11px;
+  color: var(--warn);
+  line-height: 1.35;
+}
+
+.slot-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.pick-btn {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 48px;
+  text-align: center;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
+}
+.pick-btn:hover:not(:disabled) {
+  border-color: #cbd5e1;
+  color: var(--text);
+}
+.pick-btn.on,
+.pick-btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: #eff6ff;
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.12);
+}
+.pick-btn.index {
+  min-width: 42px;
+  padding: 8px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Legacy class names still used in Setup dialog */
 .arm-slots {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
@@ -912,7 +1020,12 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   color: var(--warn);
 }
 
-.arm-slot-picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.arm-slot-picks { display: flex; flex-wrap: wrap; gap: 8px; }
+.arm-slot-picks .chip {
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
 .arm-slot-picks .chip.on {
   border-color: var(--accent);
   background: #eff6ff;
@@ -960,5 +1073,6 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   font-size: 11px;
   color: var(--muted);
 }
-.identify-note.busy { color: var(--accent); }
+.identify-note.warn { color: var(--warn); }
 .identify-note.found { color: var(--pass); }
+.identify-note.busy { color: var(--accent); }

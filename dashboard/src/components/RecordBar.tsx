@@ -70,6 +70,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
   }
 
   const state = status.state;
+  const recordReady = !status.teleop || status.teleop.record_ready !== false;
 
   // Record is refused while teleop is observing, because a take whose follower
   // was never driven is unusable data. Rather than only saying so after the
@@ -103,7 +104,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
       <div className="inner label-bar">
         <button
           className={`record-btn ${state}`}
-          disabled={busy || state === "saving"}
+          disabled={busy || state === "saving" || ((state === "idle" || state === "pending") && !recordReady)}
           // Not tabbable: otherwise Space would both fire the key handler and
           // activate the focused button, running the command twice.
           tabIndex={-1}
@@ -140,6 +141,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
           )}
           {state !== "recording" && state !== "pending" && status.message}
         </span>
+        {!recordReady && <span className="hint">waiting for the follower to settle under leader control</span>}
 
         {state === "pending" && (
           <div className="commit-bar" aria-hidden>

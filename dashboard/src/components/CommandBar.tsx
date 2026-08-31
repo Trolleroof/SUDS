@@ -8,10 +8,13 @@ import {
   reconcileArmPorts,
   resolveArmPorts,
   shortPort,
+  compactPort,
   writeStoredSetup,
   type ArmRole,
 } from "@/lib/arm-ports";
+import { resolveCameras } from "@/lib/camera-ports";
 import { useArmsConfig } from "@/lib/use-arms-config";
+import { useCamerasConfig } from "@/lib/use-cameras-config";
 
 type CameraState = { name: string; index: number; streaming: boolean; error: string | null };
 
@@ -43,6 +46,7 @@ const EMPTY: Config = {
 
 export default function CommandBar({ recorderRunning }: { recorderRunning: boolean }) {
   const { configured, ready: armsReady } = useArmsConfig();
+  const { configured: cameraDefaults, ready: camerasReady } = useCamerasConfig();
   const [config, setConfig] = useState<Config>(EMPTY);
   const [teleop, setTeleop] = useState<ProcStatus | null>(null);
   const [cameras, setCameras] = useState<ProcStatus | null>(null);
@@ -59,17 +63,19 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
 
   // Permanent ports from config/arms.json — no rescan required on load.
   useEffect(() => {
-    if (!armsReady) return;
+    if (!armsReady || !camerasReady) return;
     setConfig((prev) => {
       const stored = readStoredSetup();
       const merged = resolveArmPorts(
         { teleopPort: (stored.teleopPort as string | null) ?? null, robotPort: (stored.robotPort as string | null) ?? null },
         configured,
       );
-      return { ...prev, teleopPort: merged.teleopPort, robotPort: merged.robotPort };
+      const cameras = resolveCameras(stored.cameras as Config["cameras"], cameraDefaults);
+      writeStoredSetup({ ...stored, ...merged, cameras });
+      return { ...prev, teleopPort: merged.teleopPort, robotPort: merged.robotPort, cameras };
     });
     setPorts([configured.teleopPort, configured.robotPort].filter(Boolean) as string[]);
-  }, [armsReady, configured]);
+  }, [armsReady, camerasReady, configured, cameraDefaults]);
 
   const scanPorts = useCallback(async () => {
     setScanning(true);
@@ -170,7 +176,7 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
         ),
         robotId: "follower",
         teleopId: "leader",
-        cameras: (stored.cameras as Config["cameras"]) ?? prev.cameras,
+        cameras: resolveCameras((stored.cameras as Config["cameras"]) ?? prev.cameras, cameraDefaults),
       }));
     } catch {
       /* storage refused */
@@ -187,7 +193,29 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
         /* transient */
       }
     }
-  }, [configured]);
+  }, [configured, cameraDefaults]);
+
+  const setCameraIndex = useCallback((name: string, index: number) => {
+    setConfig((prev) => {
+      const current = prev.cameras.find((camera) => camera.name === name);
+      if (!current) return prev;
+      const taken = prev.cameras.filter((camera) => camera.name !== name).map((camera) => camera.index);
+      const cameras = prev.cameras.map((camera) => {
+        if (camera.name === name) return { ...camera, index };
+        if (camera.index === index && !taken.includes(current.index)) return { ...camera, index: current.index };
+        return camera;
+      });
+      const next = { ...prev, cameras };
+      writeStoredSetup(next);
+      return next;
+    });
+  }, []);
+
+  const runningCameraNames = new Set((cameras?.cameras ?? []).map((camera) => camera.name));
+  const needsCameraRestart =
+    Boolean(cameras?.running) &&
+    (config.cameras.length !== runningCameraNames.size ||
+      config.cameras.some((camera) => !runningCameraNames.has(camera.name)));
 
   useEffect(() => {
     void poll();
@@ -242,20 +270,29 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
     <section className="panel">
       <h2>Quick commands</h2>
       <div className="inner">
-        <div className="arm-slots">
-          {(["leader", "follower"] as ArmRole[]).map((role) => (
-            <ArmSlot
-              key={role}
-              role={role}
-              port={role === "leader" ? config.teleopPort : config.robotPort}
-              ports={ports}
-              identified={identified}
-              onPick={(port) => pick(role, port)}
-            />
-          ))}
-          <div className="arm-slot-actions">
-            <button className="chip" disabled={scanning} onClick={() => void scanPorts()}>
-              {scanning ? "Scanning…" : "Rescan"}
+        <div className="hardware-setup">
+          <div className="hardware-grid">
+            {(["leader", "follower"] as ArmRole[]).map((role) => (
+              <ArmSlot
+                key={role}
+                role={role}
+                port={role === "leader" ? config.teleopPort : config.robotPort}
+                ports={ports}
+                identified={identified}
+                onPick={(port) => pick(role, port)}
+              />
+            ))}
+            {config.cameras.map((camera) => (
+              <CameraSlot
+                key={camera.name}
+                camera={camera}
+                onPick={(index) => setCameraIndex(camera.name, index)}
+              />
+            ))}
+          </div>
+          <div className="hardware-actions">
+            <button className="chip wide" disabled={scanning} onClick={() => void scanPorts()}>
+              {scanning ? "Scanning…" : "Rescan USB"}
             </button>
             <button
               className="verdict"
@@ -271,6 +308,13 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
           <p className={`identify-note ${identifying ? "busy" : identified ? "found" : ""}`}>{identifyNote}</p>
         )}
         {portWarning && <p className="identify-note">{portWarning}</p>}
+
+        {needsCameraRestart && (
+          <p className="identify-note warn">
+            Camera config changed — stop and start cameras to pick up{" "}
+            {config.cameras.filter((camera) => !runningCameraNames.has(camera.name)).map((c) => c.name).join(", ")}
+          </p>
+        )}
 
         {rows.map((row) => {
           const running = Boolean(row.status?.running);
@@ -364,29 +408,64 @@ function ArmSlot({
   const mismatch = known && known !== role;
 
   return (
-    <article className={`arm-slot ${port ? "assigned" : ""} ${identified === port ? "found" : ""}`}>
+    <article className={`hardware-slot ${port ? "assigned" : ""} ${identified === port ? "found" : ""}`}>
       <header>
         <strong>{label}</strong>
         {port ? (
-          <code title={port}>{shortPort(port)}</code>
+          <span className="slot-badge" title={port}>
+            {compactPort(port)}
+          </span>
         ) : (
-          <span className="hint">Not assigned</span>
+          <span className="slot-badge muted">unassigned</span>
         )}
       </header>
       {mismatch && (
-        <p className="arm-slot-warn">Serial usually maps to {known} — double-check assignment</p>
+        <p className="hardware-slot-warn">Serial usually maps to {known} — double-check</p>
       )}
-      <div className="arm-slot-picks">
+      <div className="slot-picks">
         {ports.length === 0 && <span className="hint">Plug in and rescan</span>}
         {ports.map((candidate) => (
           <button
             key={candidate}
             type="button"
-            className={`chip ${port === candidate ? "on" : ""}`}
+            className={`pick-btn ${port === candidate ? "on" : ""}`}
             aria-pressed={port === candidate}
+            title={candidate}
             onClick={() => onPick(candidate)}
           >
-            {shortPort(candidate)}
+            {compactPort(candidate)}
+          </button>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function CameraSlot({
+  camera,
+  onPick,
+}: {
+  camera: { name: string; index: number };
+  onPick: (index: number) => void;
+}) {
+  const label = camera.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+  return (
+    <article className="hardware-slot assigned">
+      <header>
+        <strong>{label}</strong>
+        <span className="slot-badge">index {camera.index}</span>
+      </header>
+      <div className="slot-picks">
+        {[0, 1, 2, 3].map((index) => (
+          <button
+            key={index}
+            type="button"
+            className={`pick-btn index ${camera.index === index ? "on" : ""}`}
+            aria-pressed={camera.index === index}
+            onClick={() => onPick(index)}
+          >
+            {index}
           </button>
         ))}
       </div>

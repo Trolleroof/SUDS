@@ -79,30 +79,29 @@ BOUNDARY = "suds-frame"
 # 10 Hz: a legible commit countdown and a live delta, on an already-open socket.
 WS_PERIOD = 0.1
 DEFAULT_REST_SECONDS = 2.0
-DEFAULT_RISE_SECONDS = 1.5
+DEFAULT_START_SECONDS = 1.5
 DEFAULT_SYNC_SECONDS = 1.0
-# SO-101 follower rest pose, in the project's normalized joint units. A loose,
-# settled pose -- shoulder and elbow drooped rather than curled tight, gripper
-# cracked open -- so the arm looks at rest instead of clenched when torque
-# drops. Tune these by feel on the physical arm; nothing here reads a range.
+# SO-101 follower rest pose, in the project's normalized joint units. Captured
+# directly off the physical arm posed by hand -- not a guess -- so change this
+# by posing the arm again and re-reading it, not by editing numbers by feel.
 REST_POSE = {
-    "shoulder_pan": 0.0,
-    "shoulder_lift": -20.0,
-    "elbow_flex": 65.0,
-    "wrist_flex": 50.0,
-    "wrist_roll": -35.0,
-    "gripper": 15.0,
+    "shoulder_pan": 0.5,
+    "shoulder_lift": -101.7,
+    "elbow_flex": 95.9,
+    "wrist_flex": 50.9,
+    "wrist_roll": 1.4,
+    "gripper": 0.8,
 }
-# Cleared, centered pose the follower rises to before it starts tracking the
-# leader, so every engage starts from the same known height instead of
-# wherever the follower was left (often curled at REST_POSE). Tune by feel.
-RISE_POSE = {
-    "shoulder_pan": 0.0,
-    "shoulder_lift": 10.0,
-    "elbow_flex": 30.0,
-    "wrist_flex": 0.0,
-    "wrist_roll": 0.0,
-    "gripper": 50.0,
+# Pose the follower eases into the instant engage is pressed, before handing
+# off to the leader -- same deal as REST_POSE: captured off the physical arm,
+# not guessed. Re-pose and re-read to change it.
+START_POSE = {
+    "shoulder_pan": 0.6,
+    "shoulder_lift": -77.0,
+    "elbow_flex": 85.3,
+    "wrist_flex": 50.9,
+    "wrist_roll": 1.3,
+    "gripper": 6.4,
 }
 
 
@@ -245,7 +244,7 @@ class Recorder:
         auto_estop: bool = False,
         engage_on_start: bool = False,
         rest_seconds: float = DEFAULT_REST_SECONDS,
-        rise_seconds: float = DEFAULT_RISE_SECONDS,
+        start_seconds: float = DEFAULT_START_SECONDS,
         sync_seconds: float = DEFAULT_SYNC_SECONDS,
         delta_grace: int = 5,
         stream_fps: float = 10.0,
@@ -287,6 +286,9 @@ class Recorder:
         # leader is wherever it was left, and sending that straight to a cold
         # follower is a full-speed snap across the arm's range.
         self.engaged = False
+        # Engagement completes its physical ramp synchronously, but recording
+        # waits for one normal leader->follower control tick after that ramp.
+        self._control_ready = False
         # Engaging needs a measured delta, and there is none until the loop has
         # read both arms once -- so this is a request, honoured on the first tick
         # that has numbers to check it against.
@@ -295,7 +297,7 @@ class Recorder:
         self.delta_limit = delta_limit
         self.auto_estop = auto_estop
         self.rest_seconds = max(0.0, rest_seconds)
-        self.rise_seconds = max(0.0, rise_seconds)
+        self.start_seconds = max(0.0, start_seconds)
         self.sync_seconds = max(0.0, sync_seconds)
         self.delta_grace = max(1, delta_grace)
         self._over_ticks = 0
@@ -510,6 +512,7 @@ class Recorder:
 
         with self.lock:
             self.engaged = engaged
+            self._control_ready = False
             self.last_message = (
                 "teleop engaged — the follower is tracking the leader"
                 if engaged
@@ -591,7 +594,7 @@ class Recorder:
         workspace from a curled rest pose, and syncing is its own eased ramp
         rather than the first raw teleop tick.
         """
-        self._ramp_to(RISE_POSE, self.rise_seconds)
+        self._ramp_to(START_POSE, self.start_seconds)
         leader_action = self.teleop.get_action()
         leader_pose = {
             key.removesuffix(".pos"): float(value)
@@ -629,6 +632,7 @@ class Recorder:
                     # yes/no the Engage button needs. A delta with no joints in
                     # it is not "aligned", it is "not measured yet".
                     "ready": bool(self._delta.get("joints")) and self._delta.get("max", 0.0) <= self.delta_limit,
+                    "record_ready": self.engaged and self._control_ready,
                     "worst": self._delta.get("max", 0.0),
                     "worst_joint": self._delta.get("max_joint"),
                 },
@@ -710,6 +714,8 @@ class Recorder:
             log.warning("teleop read/write failed, skipping this tick: %s", err)
             return None, None
         self._update_delta(action, observation)
+        with self.lock:
+            self._control_ready = bool(sent) and bool(self._delta.get("joints")) and self._delta.get("max", 0.0) <= self.delta_limit
         return observation, sent
 
     def _engage_on_start(self) -> None:
@@ -793,10 +799,15 @@ class Recorder:
         result: dict[str, Any] = {"ok": True}
         if command == "record":
             with self.lock:
-                pending = self.state == PENDING
-            if pending:
-                self._save()
-            self._begin()
+                ready = self.engaged and self._control_ready
+            if not ready:
+                result = {"ok": False, "error": "follower is not ready — wait for leader control to settle before recording"}
+            else:
+                with self.lock:
+                    pending = self.state == PENDING
+                if pending:
+                    self._save()
+                self._begin()
         elif command == "stop":
             self._pend()
             self._rest_and_release()
@@ -1412,16 +1423,16 @@ def main() -> int:
         help="Seconds used to ease the follower to the relaxed pose before torque is released.",
     )
     parser.add_argument(
-        "--rise-seconds",
+        "--start-seconds",
         type=float,
-        default=DEFAULT_RISE_SECONDS,
-        help="Seconds used to raise the follower to RISE_POSE at the start of an engage.",
+        default=DEFAULT_START_SECONDS,
+        help="Seconds used to raise the follower to START_POSE at the start of an engage.",
     )
     parser.add_argument(
         "--sync-seconds",
         type=float,
         default=DEFAULT_SYNC_SECONDS,
-        help="Seconds used to ease from RISE_POSE onto the leader's live pose before tracking begins.",
+        help="Seconds used to ease from START_POSE onto the leader's live pose before tracking begins.",
     )
     parser.add_argument("--stream-fps", type=float, default=10.0, help="Rate of the browser camera streams.")
     parser.add_argument("--stream-quality", type=int, default=70, help="JPEG quality of the camera streams.")
@@ -1487,7 +1498,7 @@ def main() -> int:
         auto_estop=args.auto_estop,
         engage_on_start=args.engage_on_start,
         rest_seconds=args.rest_seconds,
-        rise_seconds=args.rise_seconds,
+        start_seconds=args.start_seconds,
         sync_seconds=args.sync_seconds,
         delta_grace=args.delta_grace,
         stream_fps=args.stream_fps,

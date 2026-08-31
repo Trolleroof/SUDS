@@ -76,16 +76,21 @@ function command(name: ProcName, config: ProcConfig): { bin: string; args: strin
     for (const port of [config.teleopPort, config.robotPort]) {
       if (!/^\/dev\/tty\.[\w.-]+$/.test(port) || !fs.existsSync(port)) return `${port} is not plugged in`;
     }
-    // LeRobot's own CLI, unmodified -- this is the command you would type.
+    // scripts/teleop_run.py, not LeRobot's own `lerobot-teleoperate`: this one
+    // eases into record_server.py's hand-posed START_POSE/REST_POSE on start
+    // and stop, so the quick check matches what recording does.
     return {
-      bin: binary("lerobot-teleoperate"),
+      bin: binary("python"),
       args: [
-        "--robot.type=so101_follower",
-        `--robot.port=${config.robotPort}`,
-        `--robot.id=${config.robotId}`,
-        "--teleop.type=so101_leader",
-        `--teleop.port=${config.teleopPort}`,
-        `--teleop.id=${config.teleopId}`,
+        path.join(repoRoot(), "scripts", "teleop_run.py"),
+        "--robot-port",
+        config.robotPort,
+        "--robot-id",
+        config.robotId,
+        "--teleop-port",
+        config.teleopPort,
+        "--teleop-id",
+        config.teleopId,
       ],
     };
   }

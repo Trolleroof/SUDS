@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { readArmsConfig } from "./arms-config";
+import { readCamerasConfig } from "./cameras-config";
 import { reconcileArmPorts } from "./arm-ports";
 import { isRunning as calibrateRunning } from "./calibrate";
 import { isRunning as recorderRunning } from "./daemon";
@@ -181,13 +182,14 @@ export async function ensureHealth(cameras: HealthCamera[] = []): Promise<{
   const invalid = validatePorts(ports);
   if (invalid) return { ok: false, error: invalid };
 
-  const key = configKey(ports.teleopPort!, ports.robotPort!, cameras);
+  const cams = cameras.length ? cameras : readCamerasConfig();
+  const key = configKey(ports.teleopPort!, ports.robotPort!, cams);
   if (isHealthRunning() && health.configKey === key) return { ok: true };
 
   const restarted = isHealthRunning();
   if (restarted) await stopHealth();
 
-  const started = startHealth({ teleopPort: ports.teleopPort!, robotPort: ports.robotPort! }, cameras);
+  const started = startHealth({ teleopPort: ports.teleopPort!, robotPort: ports.robotPort! }, cams);
   return started.ok ? { ok: true, restarted } : started;
 }
 

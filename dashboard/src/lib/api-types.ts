@@ -141,6 +141,7 @@ export type CalibrationPayload = {
 export type TeleopSync = {
   engaged: boolean;
   ready: boolean;
+  record_ready?: boolean;
   worst: number;
   worst_joint: string | null;
 };

@@ -10,7 +10,9 @@ import {
   resolveArmPorts,
   shortPort,
 } from "@/lib/arm-ports";
+import { resolveCameras } from "@/lib/camera-ports";
 import { useArmsConfig } from "@/lib/use-arms-config";
+import { useCamerasConfig } from "@/lib/use-cameras-config";
 
 type DaemonStatus = {
   running: boolean;
@@ -54,6 +56,7 @@ export default function DaemonPanel({
   onChanged: () => void;
 }) {
   const { configured, ready: armsReady } = useArmsConfig();
+  const { configured: cameraDefaults, ready: camerasReady } = useCamerasConfig();
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [scan, setScan] = useState<Scan | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -98,7 +101,7 @@ export default function DaemonPanel({
   // Seed the form from the last run if there is one, otherwise from the dataset
   // on screen — so the common case is "press Start".
   useEffect(() => {
-    if (config || !status || !armsReady) return;
+    if (config || !status || !armsReady || !camerasReady) return;
     const stored = readStoredSetup();
     const ports = resolveArmPorts(
       {
@@ -107,10 +110,11 @@ export default function DaemonPanel({
       },
       configured,
     );
-    const datasetCams = (datasetCameras.length ? datasetCameras : ["third_person", "wrist"]).map((name, i) => ({
+    const datasetCams = (datasetCameras.length ? datasetCameras : cameraDefaults.map((c) => c.name)).map((name, i) => ({
       name,
-      index: i,
+      index: cameraDefaults.find((camera) => camera.name === name)?.index ?? i,
     }));
+    const cameras = resolveCameras(stored.cameras as CameraSpec[], datasetCams);
     setConfig(
       status.config ?? {
         repoId: (stored.repoId as string) || repoId || "suds/live",
@@ -118,14 +122,14 @@ export default function DaemonPanel({
         fps: (stored.fps as number) || 30,
         robotPort: ports.robotPort ?? DEFAULT_ARM_PORTS.robotPort,
         teleopPort: ports.teleopPort ?? DEFAULT_ARM_PORTS.teleopPort,
-        cameras: (stored.cameras as CameraSpec[])?.length ? (stored.cameras as CameraSpec[]) : datasetCams,
+        cameras,
         deltaLimit: (stored.deltaLimit as number) ?? 25,
         autoEstop: (stored.autoEstop as boolean) ?? false,
         engageOnStart: (stored.engageOnStart as boolean) ?? true,
         commitSeconds: (stored.commitSeconds as number) ?? 6,
       },
     );
-  }, [config, status, repoId, datasetCameras, armsReady, configured]);
+  }, [config, status, repoId, datasetCameras, armsReady, camerasReady, configured, cameraDefaults]);
 
   const post = useCallback(
     async (action: "start" | "stop" | "restart", body?: unknown) => {

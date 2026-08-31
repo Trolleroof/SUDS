@@ -20,6 +20,13 @@ export function shortPort(port: string): string {
   return port.replace(/^\/dev\/tty\./, "");
 }
 
+/** Last five digits — enough to tell two arms apart in a tight UI. */
+export function compactPort(port: string): string {
+  const serial = shortPort(port);
+  const tail = serial.match(/(\d{5})$/);
+  return tail ? tail[1] : serial.length > 10 ? serial.slice(-8) : serial;
+}
+
 /** Map a scanned port to a known arm role, if we recognise the serial. */
 export function knownRoleForPort(port: string): ArmRole | null {
   const serial = shortPort(port);
