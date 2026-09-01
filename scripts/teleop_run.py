@@ -29,6 +29,7 @@ from record_server import (  # noqa: E402
     DEFAULT_SYNC_SECONDS,
     REST_POSE,
     START_POSE,
+    _ease_in_out,
     _ease_out_cubic,
 )
 
@@ -53,13 +54,14 @@ def ramp_to(follower, pose: dict[str, float], seconds: float, fps: float) -> Non
     target = {key: pose.get(key.removesuffix(".pos"), value) for key, value in current.items()}
     steps = max(1, round(fps * seconds))
     for step in range(1, steps + 1):
-        fraction = _ease_out_cubic(step / steps)
+        fraction = _ease_in_out(step / steps)
         follower.send_action({
             key: value + fraction * (target[key] - value)
             for key, value in current.items()
         })
         if step < steps:
             time.sleep(1.0 / fps)
+    time.sleep(0.2)
 
 
 def main() -> int:

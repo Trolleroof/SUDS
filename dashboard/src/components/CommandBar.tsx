@@ -314,7 +314,7 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
               </span>
               <span className="hint">
                 {blocked
-                  ? "Stop the recorder first — it uses the same ports"
+                  ? `Active inside the running recorder (${row.name === "teleop" ? "teleop & arms" : "cameras"} already live)`
                   : row.status?.exit && row.status.exit.code !== 0 && !running
                     ? `Exited with code ${row.status.exit.code}`
                     : row.detail}

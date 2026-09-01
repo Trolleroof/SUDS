@@ -65,6 +65,16 @@ export function isHealthRunning(): boolean {
   return health.child !== null && health.child.exitCode === null && !health.child.killed;
 }
 
+let lastRecorderSeen = 0;
+
+export function markRecorderActive(): void {
+  lastRecorderSeen = Date.now();
+}
+
+export function isRecorderActive(): boolean {
+  return recorderRunning() || (Date.now() - lastRecorderSeen < 15_000);
+}
+
 /**
  * True when something else holds an arm serial port, or is about to.
  *
@@ -75,7 +85,7 @@ export function isHealthRunning(): boolean {
  * that long -- means a crashed calibration cannot suppress health forever.
  */
 export function portsBlocked(): boolean {
-  return health.claimed || recorderRunning() || procRunning("teleop") || calibrateRunning();
+  return health.claimed || isRecorderActive() || procRunning("teleop") || calibrateRunning();
 }
 
 /**

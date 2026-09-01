@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { markRecorderActive } from "@/lib/health";
+
 export const dynamic = "force-dynamic";
 
 /** Where scripts/record_server.py is listening. */
@@ -52,6 +54,9 @@ async function proxy(action: string, method: string, body?: string) {
       body: method === "POST" ? body || "{}" : undefined,
       cache: "no-store",
     });
+    if (upstream.ok || upstream.status < 500) {
+      markRecorderActive();
+    }
     return NextResponse.json(await upstream.json(), { status: upstream.status });
   } catch {
     // The daemon is optional, and the rest of the dashboard works fine without it.

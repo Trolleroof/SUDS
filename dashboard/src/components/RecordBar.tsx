@@ -113,31 +113,17 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
       if (s.state === "recording" || s.state === "saving") return;
 
       if (!s.teleop?.engaged) {
-        setPhase("waiting");
-        s = await waitUntilReady(recorder, s, () => cancelled.current, setWaitHint);
-        throwIfCancelled();
         setPhase("engaging");
-        setWaitHint("handing the follower to the leader…");
+        setWaitHint("syncing follower to leader…");
         const engaged = await send("engage");
         if (!engaged) return;
         s = engaged;
       }
 
-      if (s.teleop && s.teleop.record_ready === false) {
-        setPhase("engaging");
-        setWaitHint("waiting for the follower to settle…");
-        const settled = await pollRecorderHttp(
-          (next) => Boolean(next?.teleop?.record_ready),
-          20_000,
-          () => cancelled.current,
-        );
-        if (settled) s = settled;
-      }
-
       throwIfCancelled();
       if (s.state === "idle" || s.state === "pending") {
         setPhase("recording");
-        setWaitHint("recording telemetry and cameras…");
+        setWaitHint("recording…");
         const recorded = await send("record");
         if (!recorded) return;
       }
@@ -260,13 +246,10 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
               (waitHint
                 ? waitHint
                 : notEngaged
-                  ? status.teleop!.ready
-                    ? "the follower is not being driven yet"
-                    : `arms ${status.teleop!.worst.toFixed(1)} apart on ${status.teleop!.worst_joint} — line them up first`
+                  ? "arms unlinked · click Record or Engage"
                   : status.message)}
           </span>
         )}
-        {!recordReady && <span className="hint">waiting for the follower to settle under leader control</span>}
 
         {state === "pending" && (
           <div className="commit-bar" aria-hidden>
