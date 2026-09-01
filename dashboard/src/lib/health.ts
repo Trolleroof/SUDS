@@ -28,7 +28,7 @@ type HealthProc = {
   claimed: boolean;
 };
 
-const store = globalThis as unknown as { __sudsHealth?: HealthProc };
+const store = globalThis as unknown as { __sudsHealth?: HealthProc; __sudsHealthLock?: Promise<unknown> };
 const health: HealthProc = (store.__sudsHealth ??= {
   child: null,
   configKey: "",
@@ -36,6 +36,25 @@ const health: HealthProc = (store.__sudsHealth ??= {
   log: [],
   claimed: false,
 });
+
+/**
+ * Serializes every check-then-act sequence in this module onto one queue.
+ *
+ * `ensureHealth`, `stopHealth` and friends all start with "is it running?"
+ * and act on the answer. Two calls close enough together -- a status poll
+ * from the browser landing next to a manual restart, say -- can both read
+ * "not running" and both spawn `health_server.py`; the second spawn's
+ * `health.child = child` silently overwrites the first's reference, and the
+ * first keeps running, untracked, still opening the arm ports out from under
+ * whatever claims them next. Routing every mutation through here means the
+ * second call sees the first's result before it reads anything.
+ */
+function withHealthLock<T>(fn: () => Promise<T>): Promise<T> {
+  const queue = store.__sudsHealthLock ?? Promise.resolve();
+  const run = queue.then(fn, fn);
+  store.__sudsHealthLock = run.catch(() => {});
+  return run;
+}
 
 function configKey(teleopPort: string, robotPort: string, cameras: HealthCamera[]): string {
   const cams = [...cameras].sort((a, b) => a.name.localeCompare(b.name));
@@ -148,7 +167,11 @@ function startHealth(
  * multiple access on port?" crash, a few seconds after pressing start. Callers
  * must await this before spawning anything that holds the arms.
  */
-export async function stopHealth(): Promise<void> {
+export function stopHealth(): Promise<void> {
+  return withHealthLock(stopHealthLocked);
+}
+
+async function stopHealthLocked(): Promise<void> {
   if (!isHealthRunning()) return;
   const child = health.child!;
   const exited = new Promise<boolean>((resolve) => {
@@ -168,7 +191,16 @@ export async function stopHealth(): Promise<void> {
  * Start (or restart) the health daemon with synced arm ports.
  * Skips when the recorder or teleop holds the serial ports — those publish hardware live.
  */
-export async function ensureHealth(cameras: HealthCamera[] = []): Promise<{
+export function ensureHealth(cameras: HealthCamera[] = []): Promise<{
+  ok: boolean;
+  error?: string;
+  skipped?: boolean;
+  restarted?: boolean;
+}> {
+  return withHealthLock(() => ensureHealthLocked(cameras));
+}
+
+async function ensureHealthLocked(cameras: HealthCamera[]): Promise<{
   ok: boolean;
   error?: string;
   skipped?: boolean;
@@ -187,7 +219,7 @@ export async function ensureHealth(cameras: HealthCamera[] = []): Promise<{
   if (isHealthRunning() && health.configKey === key) return { ok: true };
 
   const restarted = isHealthRunning();
-  if (restarted) await stopHealth();
+  if (restarted) await stopHealthLocked();
 
   const started = startHealth({ teleopPort: ports.teleopPort!, robotPort: ports.robotPort! }, cams);
   return started.ok ? { ok: true, restarted } : started;

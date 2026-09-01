@@ -12,7 +12,7 @@ import {
   writeStoredSetup,
   type ArmRole,
 } from "@/lib/arm-ports";
-import { resolveCameras } from "@/lib/camera-ports";
+import { sortCamerasForDisplay } from "@/lib/camera-ports";
 import { useArmsConfig } from "@/lib/use-arms-config";
 import { useCamerasConfig } from "@/lib/use-cameras-config";
 
@@ -70,7 +70,7 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
         { teleopPort: (stored.teleopPort as string | null) ?? null, robotPort: (stored.robotPort as string | null) ?? null },
         configured,
       );
-      const cameras = resolveCameras(stored.cameras as Config["cameras"], cameraDefaults);
+      const cameras = cameraDefaults;
       writeStoredSetup({ ...stored, ...merged, cameras });
       return { ...prev, teleopPort: merged.teleopPort, robotPort: merged.robotPort, cameras };
     });
@@ -176,7 +176,7 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
         ),
         robotId: "follower",
         teleopId: "leader",
-        cameras: resolveCameras((stored.cameras as Config["cameras"]) ?? prev.cameras, cameraDefaults),
+        cameras: cameraDefaults,
       }));
     } catch {
       /* storage refused */
@@ -194,22 +194,6 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
       }
     }
   }, [configured, cameraDefaults]);
-
-  const setCameraIndex = useCallback((name: string, index: number) => {
-    setConfig((prev) => {
-      const current = prev.cameras.find((camera) => camera.name === name);
-      if (!current) return prev;
-      const taken = prev.cameras.filter((camera) => camera.name !== name).map((camera) => camera.index);
-      const cameras = prev.cameras.map((camera) => {
-        if (camera.name === name) return { ...camera, index };
-        if (camera.index === index && !taken.includes(current.index)) return { ...camera, index: current.index };
-        return camera;
-      });
-      const next = { ...prev, cameras };
-      writeStoredSetup(next);
-      return next;
-    });
-  }, []);
 
   const runningCameraNames = new Set((cameras?.cameras ?? []).map((camera) => camera.name));
   const needsCameraRestart =
@@ -283,11 +267,7 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
               />
             ))}
             {config.cameras.map((camera) => (
-              <CameraSlot
-                key={camera.name}
-                camera={camera}
-                onPick={(index) => setCameraIndex(camera.name, index)}
-              />
+              <CameraSlot key={camera.name} camera={camera} />
             ))}
           </div>
           <div className="hardware-actions">
@@ -358,7 +338,10 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
 
         {cameras?.running && (
           <div className="cmd-cams">
-            {(cameras.cameras ?? config.cameras.map((c) => ({ ...c, streaming: false, error: null }))).map(
+            {sortCamerasForDisplay(
+              cameras.cameras ?? config.cameras.map((c) => ({ ...c, streaming: false, error: null })),
+              (camera) => camera.name,
+            ).map(
               (camera) => (
                 <figure className="live-card" key={camera.name}>
                   <figcaption>
@@ -441,34 +424,15 @@ function ArmSlot({
   );
 }
 
-function CameraSlot({
-  camera,
-  onPick,
-}: {
-  camera: { name: string; index: number };
-  onPick: (index: number) => void;
-}) {
+function CameraSlot({ camera }: { camera: { name: string; index: number } }) {
   const label = camera.name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
   return (
-    <article className="hardware-slot assigned">
+    <article className="hardware-slot assigned locked">
       <header>
         <strong>{label}</strong>
         <span className="slot-badge">index {camera.index}</span>
       </header>
-      <div className="slot-picks">
-        {[0, 1, 2, 3].map((index) => (
-          <button
-            key={index}
-            type="button"
-            className={`pick-btn index ${camera.index === index ? "on" : ""}`}
-            aria-pressed={camera.index === index}
-            onClick={() => onPick(index)}
-          >
-            {index}
-          </button>
-        ))}
-      </div>
     </article>
   );
 }

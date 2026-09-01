@@ -54,8 +54,7 @@ async function proxy(action: string, method: string, body?: string) {
     });
     return NextResponse.json(await upstream.json(), { status: upstream.status });
   } catch {
-    // Not an error worth shouting about -- the daemon is optional, and the rest
-    // of the dashboard works fine without it.
-    return NextResponse.json({ offline: true, error: `no recorder at ${RECORDER}` }, { status: 503 });
+    // The daemon is optional, and the rest of the dashboard works fine without it.
+    return NextResponse.json({ ok: false, offline: true, error: `no recorder at ${RECORDER}` }, { status: 200 });
   }
 }

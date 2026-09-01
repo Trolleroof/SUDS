@@ -227,19 +227,17 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
                 onChanged={refresh}
               />
 
-              {recorderUp && (
-                <div className="toolbar">
-                  <SafetyBar recorder={recorder} />
-                  <RecordBar recorder={recorder} />
-                </div>
-              )}
+              <div className="toolbar">
+                <SafetyBar recorder={recorder} />
+                <RecordBar recorder={recorder} />
+              </div>
 
               {recorderUp && <TeleopSyncPanel recorder={recorder} />}
               {recorderUp && <LiveCameras recorder={recorder} />}
               <CalibrationPanel recorderOnline={recorderUp} />
               {!recorderUp && (
                 <p className="empty">
-                  Start the recorder above to see the arms and the cameras.
+                  Press Record to start the recorder and sync the arms, or open Setup above to configure it first.
                 </p>
               )}
             </>

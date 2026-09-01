@@ -809,7 +809,10 @@ class Recorder:
                     self._save()
                 self._begin()
         elif command == "stop":
-            self._pend()
+            # Stop means keep the take: write parquet + camera videos now so
+            # the dashboard Review tab can play it without waiting out a
+            # commit window or shutting the daemon down.
+            self._save()
             self._rest_and_release()
         elif command == "discard":
             self._discard()
@@ -859,20 +862,25 @@ class Recorder:
                 return
             self.state = SAVING
             frames = self.frames
+            if frames == 0:
+                self.state = IDLE
+                self.last_message = "nothing to save"
+                return
             self.last_message = "encoding…"
         # Blocks the loop for the length of the video encode. That is deliberate:
         # the arm is not being teleoperated between takes anyway, and letting it
         # race a second recording would corrupt the writer's buffer. (The e-stop
         # is not affected -- it never waits on the loop.)
-        self.dataset.save_episode()
-        # `meta/episodes` is written through an open ParquetWriter whose footer
-        # only lands on close, so an episode is not *readable* until the dataset
-        # is finalized. Reopening after every take is what makes "stop" mean
-        # "reviewable in the dashboard" rather than "reviewable when I quit".
-        self._since_flush += 1
-        if self._since_flush >= self.flush_every:
+        try:
+            self.dataset.save_episode()
             self.dataset = reopen(self.dataset)
-            self._since_flush = 0
+        except Exception as err:  # noqa: BLE001
+            with self.lock:
+                self.state = PENDING
+                self.last_message = f"save failed: {err}"
+            log.exception("save failed")
+            return
+        self._since_flush = 0
         with self.lock:
             self.state = IDLE
             self.frames = 0
@@ -1442,68 +1450,84 @@ def main() -> int:
         parser.error("--robot-port and --teleop-port are required")
 
     robot, teleop, camera_meta = build_hardware(args)
-    robot.connect()
-    teleop.connect()
 
-    features = {
-        **hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=True),
-        **hw_to_dataset_features(robot.action_features, ACTION, use_video=True),
-    }
+    # Connecting the arms, opening the cameras and creating or resuming the
+    # dataset can take several seconds on real hardware -- long enough that a
+    # Stop pressed during this window is not a hypothetical. Nothing has
+    # recorded a frame yet at this point, so there is nothing to save; the
+    # only job here is to say so plainly and leave the ports closed, instead
+    # of an interrupt landing mid-connect with no handler for it and exiting
+    # in whatever state that leaves things, unexplained in the log.
+    try:
+        robot.connect()
+        teleop.connect()
 
-    from lerobot.utils.constants import HF_LEROBOT_HOME
+        features = {
+            **hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=True),
+            **hw_to_dataset_features(robot.action_features, ACTION, use_video=True),
+        }
 
-    if (HF_LEROBOT_HOME / args.repo_id).exists():
-        # `root` is required: without it resume() would build a writer over the
-        # revision-safe Hub snapshot cache, which it refuses to do. Same reason
-        # as in reopen() -- and we always want the local directory anyway.
-        dataset = LeRobotDataset.resume(
-            repo_id=args.repo_id,
-            root=HF_LEROBOT_HOME / args.repo_id,
-            rgb_encoder=RGBEncoderConfig(vcodec="h264"),
-        )
-        log.info("resuming %s at %d episodes", args.repo_id, dataset.meta.total_episodes)
-        # An existing dataset's schema is fixed. Adding frames under camera names
-        # it was not created with fails deep inside the writer, one Record press
-        # later; catching it here says which names it actually wants.
-        existing = {key.split(".")[-1] for key in dataset.meta.features if key.startswith(f"{OBS_STR}.images.")}
-        if existing != set(camera_meta):
-            parser.error(
-                f"{args.repo_id} was recorded with cameras {sorted(existing)}, but this run configures "
-                f"{sorted(camera_meta)}. Pass --camera NAME=INDEX matching the dataset, or record into a new "
-                "--repo-id."
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        if (HF_LEROBOT_HOME / args.repo_id).exists():
+            # `root` is required: without it resume() would build a writer over the
+            # revision-safe Hub snapshot cache, which it refuses to do. Same reason
+            # as in reopen() -- and we always want the local directory anyway.
+            dataset = LeRobotDataset.resume(
+                repo_id=args.repo_id,
+                root=HF_LEROBOT_HOME / args.repo_id,
+                rgb_encoder=RGBEncoderConfig(vcodec="h264"),
             )
-    else:
-        dataset = LeRobotDataset.create(
-            repo_id=args.repo_id,
-            fps=args.fps,
-            features=features,
-            robot_type=getattr(robot, "name", "so101_follower"),
-            use_videos=True,
-            # AV1 (the default) only decodes in Safari on M3 and newer; the
-            # dashboard has to play these back.
-            rgb_encoder=RGBEncoderConfig(vcodec="h264"),
-        )
-        log.info("created %s", args.repo_id)
+            log.info("resuming %s at %d episodes", args.repo_id, dataset.meta.total_episodes)
+            # An existing dataset's schema is fixed. Adding frames under camera names
+            # it was not created with fails deep inside the writer, one Record press
+            # later; catching it here says which names it actually wants.
+            existing = {key.split(".")[-1] for key in dataset.meta.features if key.startswith(f"{OBS_STR}.images.")}
+            if existing != set(camera_meta):
+                parser.error(
+                    f"{args.repo_id} was recorded with cameras {sorted(existing)}, but this run configures "
+                    f"{sorted(camera_meta)}. Pass --camera NAME=INDEX matching the dataset, or record into a new "
+                    "--repo-id."
+                )
+        else:
+            dataset = LeRobotDataset.create(
+                repo_id=args.repo_id,
+                fps=args.fps,
+                features=features,
+                robot_type=getattr(robot, "name", "so101_follower"),
+                use_videos=True,
+                # AV1 (the default) only decodes in Safari on M3 and newer; the
+                # dashboard has to play these back.
+                rgb_encoder=RGBEncoderConfig(vcodec="h264"),
+            )
+            log.info("created %s", args.repo_id)
 
-    recorder = Recorder(
-        robot,
-        teleop,
-        dataset,
-        args.fps,
-        args.task,
-        args.commit_seconds,
-        args.flush_every,
-        camera_meta=camera_meta,
-        delta_limit=args.delta_limit,
-        auto_estop=args.auto_estop,
-        engage_on_start=args.engage_on_start,
-        rest_seconds=args.rest_seconds,
-        start_seconds=args.start_seconds,
-        sync_seconds=args.sync_seconds,
-        delta_grace=args.delta_grace,
-        stream_fps=args.stream_fps,
-        stream_quality=args.stream_quality,
-    )
+        recorder = Recorder(
+            robot,
+            teleop,
+            dataset,
+            args.fps,
+            args.task,
+            args.commit_seconds,
+            args.flush_every,
+            camera_meta=camera_meta,
+            delta_limit=args.delta_limit,
+            auto_estop=args.auto_estop,
+            engage_on_start=args.engage_on_start,
+            rest_seconds=args.rest_seconds,
+            start_seconds=args.start_seconds,
+            sync_seconds=args.sync_seconds,
+            delta_grace=args.delta_grace,
+            stream_fps=args.stream_fps,
+            stream_quality=args.stream_quality,
+        )
+    except KeyboardInterrupt:
+        log.info("interrupted while connecting — nothing was recorded")
+        if robot.is_connected:
+            robot.disconnect()
+        if teleop.is_connected:
+            teleop.disconnect()
+        return 0
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(recorder))
     server.daemon_threads = True

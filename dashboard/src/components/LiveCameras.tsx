@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import type { Recorder } from "@/lib/use-recorder";
+import { sortCamerasForDisplay } from "@/lib/camera-ports";
 
 /**
  * Live view of every camera the recorder owns — the third-person view of the
@@ -17,7 +18,7 @@ import type { Recorder } from "@/lib/use-recorder";
  */
 export default function LiveCameras({ recorder }: { recorder: Recorder }) {
   const { status } = recorder;
-  const cameras = status?.cameras ?? [];
+  const cameras = sortCamerasForDisplay(status?.cameras ?? [], (name) => name);
   const [focus, setFocus] = useState<string | null>(null);
   // Bumping this remounts the <img>, which is how you restart an MJPEG stream.
   const [nonce, setNonce] = useState(0);

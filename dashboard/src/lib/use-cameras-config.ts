@@ -27,7 +27,6 @@ export function useCamerasConfig() {
   }, []);
 
   useEffect(() => {
-    if (cached) return;
     void reload();
   }, [reload]);
 

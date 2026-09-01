@@ -11,7 +11,23 @@ export type Recorder = {
   /** Last command the daemon refused, e.g. "not moved yet: wrist_flex". */
   error: string | null;
   dismissError: () => void;
-  send: (action: RecorderAction, payload?: Record<string, unknown>) => Promise<boolean>;
+  /** Resolves to the daemon's new status, or null if the command was refused. */
+  send: (action: RecorderAction, payload?: Record<string, unknown>) => Promise<RecorderStatus | null>;
+  /**
+   * Skip the reconnect backoff and try the websocket right now. For right after
+   * something else (e.g. `/api/daemon/start`) is known to have brought the
+   * daemon up -- otherwise the hook may still be waiting out a multi-second
+   * backoff from before the daemon existed to connect to.
+   */
+  reconnectNow: () => void;
+  /**
+   * Wait for a status condition to be met over the websocket stream without HTTP polling.
+   */
+  waitForStatus: (
+    test: (status: RecorderStatus | null) => boolean,
+    timeoutMs?: number,
+    cancelled?: () => boolean,
+  ) => Promise<RecorderStatus | null>;
 };
 
 const OFFLINE: RecorderStatus = {
@@ -55,6 +71,9 @@ export function useRecorder({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const statusRef = useRef<RecorderStatus | null>(null);
+  const listeners = useRef<Set<(status: RecorderStatus) => void>>(new Set());
+
   const savedCount = useRef<number | null>(null);
   const socket = useRef<WebSocket | null>(null);
   // Callbacks live in a ref so reconnect logic does not re-run when a parent
@@ -63,7 +82,15 @@ export function useRecorder({
   handlers.current = { onEpisodeSaved, onRepoId };
 
   const apply = useCallback((next: RecorderStatus) => {
+    statusRef.current = next;
     setStatus(next);
+    listeners.current.forEach((fn) => {
+      try {
+        fn(next);
+      } catch {
+        /* listener error */
+      }
+    });
     handlers.current.onRepoId?.(next.repo_id);
     // Refresh the episode list exactly when a take lands, not on a timer.
     if (savedCount.current !== null && next.saved_episodes > savedCount.current) {
@@ -71,6 +98,8 @@ export function useRecorder({
     }
     savedCount.current = next.saved_episodes;
   }, []);
+
+  const reconnectRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     let live = true;
@@ -116,12 +145,24 @@ export function useRecorder({
 
     function schedule() {
       if (!live) return;
-      setStatus((prev) => (prev ? { ...prev, offline: true } : { ...OFFLINE }));
+      apply(statusRef.current ? { ...statusRef.current, offline: true } : { ...OFFLINE });
       // 1s, 2s, 4s … capped at 15s. The daemon being down is the normal state
       // before you press Start, not an error worth retrying hard.
       const delay = Math.min(15_000, 1000 * 2 ** attempt++);
       retry = setTimeout(() => void connect(), delay);
     }
+
+    reconnectRef.current = () => {
+      if (!live) return;
+      clearTimeout(retry);
+      attempt = 0;
+      if (socket.current) {
+        socket.current.onclose = null;
+        socket.current.close();
+        socket.current = null;
+      }
+      void connect();
+    };
 
     void connect();
     return () => {
@@ -136,6 +177,45 @@ export function useRecorder({
       }
     };
   }, [apply]);
+
+  const waitForStatus = useCallback(
+    (
+      test: (s: RecorderStatus | null) => boolean,
+      timeoutMs = 90_000,
+      cancelled: () => boolean = () => false,
+    ): Promise<RecorderStatus | null> => {
+      if (cancelled()) return Promise.resolve(null);
+      if (statusRef.current && test(statusRef.current)) {
+        return Promise.resolve(statusRef.current);
+      }
+      return new Promise((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const onUpdate = (next: RecorderStatus) => {
+          if (cancelled()) {
+            cleanup();
+            resolve(null);
+            return;
+          }
+          if (test(next)) {
+            cleanup();
+            resolve(next);
+          }
+        };
+        const cleanup = () => {
+          if (timer) clearTimeout(timer);
+          listeners.current.delete(onUpdate);
+        };
+        listeners.current.add(onUpdate);
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            cleanup();
+            resolve(statusRef.current);
+          }, timeoutMs);
+        }
+      });
+    },
+    [],
+  );
 
   const send = useCallback(
     async (action: RecorderAction, payload: Record<string, unknown> = {}) => {
@@ -153,12 +233,12 @@ export function useRecorder({
         if (body?.state) apply(body as RecorderStatus);
         if (!res.ok || body?.ok === false) {
           setError(body?.error ?? `${action} failed`);
-          return false;
+          return null;
         }
-        return true;
+        return body?.state ? (body as RecorderStatus) : null;
       } catch (err) {
         setError((err as Error).message);
-        return false;
+        return null;
       } finally {
         setBusy(false);
       }
@@ -166,5 +246,13 @@ export function useRecorder({
     [apply],
   );
 
-  return { status, busy, error, dismissError: () => setError(null), send };
+  return {
+    status,
+    busy,
+    error,
+    dismissError: () => setError(null),
+    send,
+    reconnectNow: () => reconnectRef.current(),
+    waitForStatus,
+  };
 }

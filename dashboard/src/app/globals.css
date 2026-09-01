@@ -238,10 +238,36 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
 .record-btn.pending { border-color: var(--warn); color: var(--warn); }
 
 .recorder.recording .record-btn .glyph { animation: pulse 1.1s ease-in-out infinite; }
+.record-btn.busy .glyph { animation: pulse 1.1s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.35; } }
-@media (prefers-reduced-motion: reduce) { .recorder.recording .record-btn .glyph { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .recorder.recording .record-btn .glyph,
+  .record-btn.busy .glyph { animation: none; }
+}
 
 .readout { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Big enough to read at arm's length while both hands are on the leader arm. */
+.record-timer {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.record-timer-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--fail);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) { .record-timer-dot { animation: none; } }
+.record-timer-clock {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fail);
+  letter-spacing: 0.02em;
+}
 
 .commit-bar { flex: 1; min-width: 60px; height: 4px; background: var(--line); border-radius: 4px; overflow: hidden; }
 .commit-bar > div { height: 100%; background: var(--warn); }
@@ -725,7 +751,14 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   .camera-preview-slot { grid-column: 1 / -1; }
 }
 
-.camera-name { width: 100%; min-width: 0; }
+.camera-row.locked {
+  grid-template-columns: minmax(100px, 140px) auto 1fr;
+}
+.camera-name-locked {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
 .camera-row-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
 
 .camera-picks { display: flex; gap: 6px; flex-wrap: wrap; }

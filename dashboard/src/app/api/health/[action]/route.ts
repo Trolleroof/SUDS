@@ -80,11 +80,12 @@ async function proxy(action: string, method: string) {
     const meta = healthStatus();
     return NextResponse.json(
       {
+        ok: false,
         offline: true,
         error: meta.running ? "health daemon did not answer in time" : `no health daemon at ${HEALTH}`,
         ...meta,
       },
-      { status: 503 },
+      { status: 200 },
     );
   }
 }

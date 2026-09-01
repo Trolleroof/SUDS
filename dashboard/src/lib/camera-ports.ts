@@ -1,11 +1,22 @@
 export type CameraSpec = { name: string; index: number };
 
 export const DEFAULT_CAMERAS: CameraSpec[] = [
-  { name: "overhead", index: 0 },
-  { name: "wrist", index: 1 },
+  { name: "wrist", index: 0 },
+  { name: "overhead", index: 1 },
 ];
 
-/** Prefer saved picks, then repo config — always include every camera from config/cameras.json. */
+/** Wrist always first (top), overhead always second (bottom). Names stay on the right USB index. */
+const DISPLAY_ORDER = ["wrist", "overhead"];
+
+export function sortCamerasForDisplay<T>(items: T[], nameOf: (item: T) => string): T[] {
+  return [...items].sort((a, b) => {
+    const ai = DISPLAY_ORDER.indexOf(nameOf(a));
+    const bi = DISPLAY_ORDER.indexOf(nameOf(b));
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+}
+
+/** Prefer saved picks, then repo config — order follows config/cameras.json. */
 export function resolveCameras(stored: CameraSpec[] | null | undefined, configured: CameraSpec[]): CameraSpec[] {
   if (!configured.length) return stored?.length ? stored : DEFAULT_CAMERAS;
   if (!stored?.length) return configured;
