@@ -25,6 +25,31 @@ type DaemonStatus = {
 
 type Scan = { ports: string[]; cameras: { index: number; name: string }[]; scanned_cameras: boolean };
 
+const JOINT_BY_ID: Record<number, string> = {
+  1: "shoulder_pan",
+  2: "shoulder_lift",
+  3: "elbow_flex",
+  4: "wrist_flex",
+  5: "wrist_roll",
+  6: "gripper",
+};
+
+/** Last traceback line is often just `{1: 777, …}` — the found-motors dump. */
+function daemonExitHint(log: string[]): string {
+  const port = log.map((line) => /motor check failed on port '([^']+)'/.exec(line)?.[1]).find(Boolean);
+  const missing: number[] = [];
+  for (const line of log) {
+    const hit = /-\s*(\d+)\s*\(expected model/.exec(line);
+    if (hit) missing.push(Number(hit[1]));
+  }
+  if (missing.length) {
+    const named = missing.map((id) => JOINT_BY_ID[id] ?? `motor ${id}`).join(" and ");
+    const where = port ? ` on ${shortPort(port)}` : "";
+    return `${named} did not answer${where} — check the daisy-chain into that joint`;
+  }
+  return log.filter((line) => !line.startsWith("—")).at(-1) ?? "unknown error";
+}
+
 /** The parts of /api/calibrate/status this panel needs: is each arm usable. */
 type CalibrationSummary = Record<"leader" | "follower", { exists: boolean; suspect: string[] }>;
 
@@ -271,7 +296,7 @@ export default function DaemonPanel({
 
       {!status.running && status.exit && status.exit.code !== 0 && status.log.length > 1 && (
         <p className="daemon-error">
-          exited ({status.exit.code}): {status.log.filter((l) => !l.startsWith("—")).slice(-1)[0]}
+          exited ({status.exit.code}): {daemonExitHint(status.log)}
         </p>
       )}
 

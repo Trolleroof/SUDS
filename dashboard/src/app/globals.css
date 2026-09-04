@@ -837,6 +837,7 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   font-weight: 550;
   font-size: 13px;
   color: var(--muted);
+  text-decoration: none;
 }
 .tab[aria-pressed="true"] {
   background: var(--panel);
@@ -1087,6 +1088,14 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   margin-top: 12px;
 }
 .cmd-cams .live-frame { max-height: 260px; }
+
+.collect-lead { margin: 0 0 12px; max-width: 52rem; }
+.collect-feed .live-frame {
+  aspect-ratio: 16 / 9;
+  max-height: min(70vh, 720px);
+  object-fit: contain;
+  background: #111;
+}
 .cmd-cams figcaption { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
 .cmd-cam-error {
   font-family: var(--mono);

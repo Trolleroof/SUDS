@@ -7,6 +7,7 @@ import { useRecorder } from "@/lib/use-recorder";
 
 import CalibrationPanel from "./CalibrationPanel";
 import CommandBar from "./CommandBar";
+import DashboardTabs from "./DashboardTabs";
 import DaemonPanel from "./DaemonPanel";
 import EpisodeList from "./EpisodeList";
 import HealthPanel from "./HealthPanel";
@@ -33,7 +34,15 @@ type Filter = "all" | "unlabeled" | "pass" | "fail" | "discard";
  */
 type View = "live" | "review";
 
-export default function Dashboard({ datasets: initial, root }: { datasets: string[]; root: string }) {
+export default function Dashboard({
+  datasets: initial,
+  root,
+  initialView = "live",
+}: {
+  datasets: string[];
+  root: string;
+  initialView?: View;
+}) {
   const [datasets, setDatasets] = useState(initial);
   const [repoId, setRepoId] = useState(initial[0] ?? "");
   // The daemon may be recording into a dataset that did not exist when the page
@@ -43,7 +52,7 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
   const [filter, setFilter] = useState<Filter>("all");
-  const [view, setView] = useState<View>("live");
+  const [view, setView] = useState<View>(initialView);
 
   const refresh = useCallback(async () => {
     void fetch("/api/datasets", { cache: "no-store" })
@@ -171,15 +180,13 @@ export default function Dashboard({ datasets: initial, root }: { datasets: strin
     <div className="app">
       <header className="header">
         <span className="brand">SUDS</span>
-        <div className="tabs">
-          {(["live", "review"] as View[]).map((name) => (
-            <button key={name} className="tab" aria-pressed={view === name} onClick={() => setView(name)}>
-              {name === "live" ? "Live" : "Review"}
-              {name === "live" && recorderUp && <span className={`dot ${recording ? "fail" : "ok"}`} aria-hidden />}
-              {name === "review" && <span className="tab-count">{episodes.length}</span>}
-            </button>
-          ))}
-        </div>
+        <DashboardTabs
+          current={view}
+          liveDot={recorderUp ? (recording ? "fail" : "ok") : null}
+          reviewCount={episodes.length}
+          onLive={() => setView("live")}
+          onReview={() => setView("review")}
+        />
         <select className="picker" value={repoId} onChange={(e) => setRepoId(e.target.value)}>
           {datasets.length === 0 && <option value="">no datasets</option>}
           {datasets.map((id) => (

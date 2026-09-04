@@ -1,7 +1,7 @@
 /** SUDS-1 arm USB identities — suffix after `/dev/tty.`. */
 
 export const ARM_SERIAL = {
-  leader: "usbmodem5C821087231",
+  leader: "usbmodem5C821071271",
   follower: "usbmodem5C821094831",
 } as const;
 
@@ -31,7 +31,7 @@ export function compactPort(port: string): string {
 export function knownRoleForPort(port: string): ArmRole | null {
   const serial = shortPort(port);
   if (!serial) return null;
-  if (serial === ARM_SERIAL.leader || serial.endsWith("87231")) return "leader";
+  if (serial === ARM_SERIAL.leader || serial.endsWith("71271")) return "leader";
   if (serial === ARM_SERIAL.follower || serial.endsWith("94831")) return "follower";
   return null;
 }

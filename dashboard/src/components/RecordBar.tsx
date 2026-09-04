@@ -46,10 +46,20 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
       }
       if (running.current) return;
 
-      if (event.key === " " && (!status || status.offline || status.state === "idle" || status.state === "pending")) {
+      if (event.key === " ") {
         event.preventDefault();
-        void goLive();
-        return;
+        if (status?.state === "recording") {
+          void send("stop");
+          return;
+        }
+        if (status?.state === "pending") {
+          void send("record");
+          return;
+        }
+        if (!status || status.offline || status.state === "idle") {
+          void goLive();
+          return;
+        }
       }
       if (!status || status.offline) return;
       const action = KEYS[event.key]?.(status.state);
@@ -147,7 +157,9 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
     recorder.dismissError();
   };
 
-  if (!status || status.offline) {
+  const isRecording = status?.state === "recording" || phase === "recording";
+
+  if (!isRecording && (!status || status.offline)) {
     return (
       <section className="panel recorder">
         <div className="inner label-bar">
@@ -180,7 +192,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
 
   // Recording is not offered while the arms are dead or the geometry is being
   // rewritten underneath the dataset.
-  if (status.state === "estopped" || status.state === "calibrating") {
+  if (status && (status.state === "estopped" || status.state === "calibrating")) {
     return (
       <section className={`panel recorder ${status.state}`}>
         <div className="inner label-bar">
@@ -195,9 +207,8 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
     );
   }
 
-  const state = status.state;
-  const recordReady = !status.teleop || status.teleop.record_ready !== false;
-  const notEngaged = state === "idle" && status.teleop && !status.teleop.engaged;
+  const state = (status?.state ?? (isRecording ? "recording" : "idle")) as RecorderState;
+  const notEngaged = state === "idle" && status?.teleop && !status.teleop.engaged;
 
   return (
     <section className={`panel recorder ${state}`}>
@@ -234,12 +245,12 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
         )}
 
         {state === "recording" ? (
-          <RecordTimer elapsed={status.elapsed_s} frames={status.frames} />
+          <RecordTimer elapsed={status?.elapsed_s ?? 0} frames={status?.frames ?? 0} />
         ) : (
           <span className="readout">
             {state === "pending" && (
               <>
-                {status.frames} frames · saving in {status.commit_in_s.toFixed(1)}s
+                {status?.frames ?? 0} frames · saving in {(status?.commit_in_s ?? 0).toFixed(1)}s
               </>
             )}
             {state !== "pending" &&
@@ -247,13 +258,13 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
                 ? waitHint
                 : notEngaged
                   ? "arms unlinked · click Record or Engage"
-                  : status.message)}
+                  : status?.message ?? "")}
           </span>
         )}
 
         {state === "pending" && (
           <div className="commit-bar" aria-hidden>
-            <div style={{ width: `${100 * (1 - status.commit_in_s / status.commit_seconds)}%` }} />
+            <div style={{ width: `${100 * (1 - (status?.commit_in_s ?? 0) / Math.max(1, status?.commit_seconds ?? 6))}%` }} />
           </div>
         )}
 
@@ -268,21 +279,37 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
 }
 
 /**
- * The elapsed time since the daemon actually flipped into RECORDING -- which is
- * to say, since the leader and follower were already synced (recording is
- * refused otherwise) -- driven straight from the daemon's own clock rather than
- * a client-side `setInterval`, so it can never drift from what lands on disk.
+ * Smooth high-resolution timer driven from the daemon's clock anchor and updated
+ * continuously on the client so the second counter increments cleanly and smoothly.
  */
 function RecordTimer({ elapsed, frames }: { elapsed: number; frames: number }) {
-  const minutes = Math.floor(elapsed / 60);
-  const seconds = elapsed - minutes * 60;
+  const [displayElapsed, setDisplayElapsed] = useState(elapsed);
+  const startRef = useRef({ elapsed, time: performance.now() });
+
+  useEffect(() => {
+    startRef.current = { elapsed, time: performance.now() };
+    setDisplayElapsed(elapsed);
+  }, [elapsed]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = performance.now();
+      const delta = (now - startRef.current.time) / 1000;
+      setDisplayElapsed(Math.max(0, startRef.current.elapsed + delta));
+    }, 50);
+    return () => clearInterval(timer);
+  }, []);
+
+  const totalSec = Math.max(0, displayElapsed);
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec - minutes * 60;
+  const secStr = seconds.toFixed(1);
+
   return (
-    <span className="record-timer" role="timer" aria-label={`recording, ${elapsed.toFixed(1)} seconds`}>
+    <span className="record-timer" role="timer" aria-label={`recording, ${totalSec.toFixed(1)} seconds`}>
       <span className="record-timer-dot" aria-hidden />
       <span className="record-timer-clock">
-        {minutes > 0 && `${minutes}:${seconds < 10 ? "0" : ""}`}
-        {seconds.toFixed(1)}
-        {minutes === 0 && "s"}
+        {minutes > 0 ? `${minutes}:${seconds < 10 ? "0" : ""}${secStr}` : `${secStr}s`}
       </span>
       <span className="hint">{frames} frames</span>
     </span>

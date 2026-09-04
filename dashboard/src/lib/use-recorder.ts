@@ -104,7 +104,48 @@ export function useRecorder({
   useEffect(() => {
     let live = true;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let attempt = 0;
+    let lastWsMessageTime = 0;
+    let lastHttpSuccessTime = 0;
+
+    async function pollHttp() {
+      if (!live) return;
+      try {
+        const res = await fetch("/api/recorder/status", { cache: "no-store" });
+        if (res.ok) {
+          const data = (await res.json()) as RecorderStatus;
+          if (data && typeof data === "object" && data.state && !data.offline) {
+            lastHttpSuccessTime = Date.now();
+            apply({ ...data, offline: false });
+          }
+        } else {
+          const now = Date.now();
+          if (now - lastWsMessageTime > 3000 && now - lastHttpSuccessTime > 3000) {
+            apply(statusRef.current ? { ...statusRef.current, offline: true } : { ...OFFLINE });
+          }
+        }
+      } catch {
+        const now = Date.now();
+        if (now - lastWsMessageTime > 3000 && now - lastHttpSuccessTime > 3000) {
+          apply(statusRef.current ? { ...statusRef.current, offline: true } : { ...OFFLINE });
+        }
+      } finally {
+        schedulePoll();
+      }
+    }
+
+    function schedulePoll() {
+      if (!live) return;
+      clearTimeout(pollTimer);
+      const isWsActive = socket.current?.readyState === WebSocket.OPEN && Date.now() - lastWsMessageTime < 800;
+      const isBusyState =
+        statusRef.current?.state === "recording" ||
+        statusRef.current?.state === "pending" ||
+        statusRef.current?.state === "saving";
+      const interval = isWsActive ? 2500 : isBusyState ? 200 : 1000;
+      pollTimer = setTimeout(() => void pollHttp(), interval);
+    }
 
     async function connect() {
       if (!live) return;
@@ -113,6 +154,7 @@ export function useRecorder({
         const res = await fetch("/api/recorder/wsurl", { cache: "no-store" });
         url = ((await res.json()) as { url: string }).url;
       } catch {
+        void pollHttp();
         return schedule();
       }
       if (!live) return;
@@ -121,15 +163,18 @@ export function useRecorder({
       try {
         ws = new WebSocket(url);
       } catch {
+        void pollHttp();
         return schedule();
       }
       socket.current = ws;
 
       ws.onopen = () => {
         attempt = 0;
+        schedulePoll();
       };
       ws.onmessage = (event) => {
         try {
+          lastWsMessageTime = Date.now();
           apply(JSON.parse(event.data as string) as RecorderStatus);
         } catch {
           /* a truncated frame is not worth tearing the socket down for */
@@ -138,16 +183,18 @@ export function useRecorder({
       ws.onerror = () => ws.close();
       ws.onclose = () => {
         socket.current = null;
-        setStatus({ ...OFFLINE });
+        // Don't abruptly flip to OFFLINE if HTTP can reach the recorder.
+        void pollHttp();
         schedule();
       };
     }
 
     function schedule() {
       if (!live) return;
-      apply(statusRef.current ? { ...statusRef.current, offline: true } : { ...OFFLINE });
-      // 1s, 2s, 4s … capped at 15s. The daemon being down is the normal state
-      // before you press Start, not an error worth retrying hard.
+      if (Date.now() - lastHttpSuccessTime > 3000 && Date.now() - lastWsMessageTime > 3000) {
+        apply(statusRef.current ? { ...statusRef.current, offline: true } : { ...OFFLINE });
+      }
+      // 1s, 2s, 4s … capped at 15s.
       const delay = Math.min(15_000, 1000 * 2 ** attempt++);
       retry = setTimeout(() => void connect(), delay);
     }
@@ -161,15 +208,16 @@ export function useRecorder({
         socket.current.close();
         socket.current = null;
       }
+      void pollHttp();
       void connect();
     };
 
+    void pollHttp();
     void connect();
     return () => {
       live = false;
       clearTimeout(retry);
-      // Drop the handler first: this close is deliberate and must not schedule
-      // a reconnect against an unmounted component.
+      clearTimeout(pollTimer);
       if (socket.current) {
         socket.current.onclose = null;
         socket.current.close();

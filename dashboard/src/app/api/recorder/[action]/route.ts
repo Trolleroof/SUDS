@@ -26,14 +26,28 @@ const ACTIONS = new Set([
 
 type Params = { params: Promise<{ action: string }> };
 
-export async function GET(_request: Request, { params }: Params) {
+export async function GET(request: Request, { params }: Params) {
   const action = (await params).action;
 
   // The browser opens the daemon's websocket directly -- Next's app router
   // cannot proxy an upgrade -- so it has to be told where that is, since
   // SUDS_RECORDER_URL is only visible on the server.
   if (action === "wsurl") {
-    return NextResponse.json({ url: `${RECORDER.replace(/^http/, "ws")}/ws` });
+    const hostHeader = request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+    const clientHost = hostHeader ? hostHeader.split(":")[0] : "127.0.0.1";
+    let wsUrl: string;
+    try {
+      const u = new URL(RECORDER);
+      const port = u.port || "8611";
+      if (u.hostname === "127.0.0.1" || u.hostname === "localhost") {
+        wsUrl = `ws://${clientHost}:${port}/ws`;
+      } else {
+        wsUrl = `${RECORDER.replace(/^http/, "ws")}/ws`;
+      }
+    } catch {
+      wsUrl = `${RECORDER.replace(/^http/, "ws")}/ws`;
+    }
+    return NextResponse.json({ url: wsUrl });
   }
   return proxy(action, "GET");
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Work out which USB port is which arm, by watching both and seeing which moves.
 
-`/dev/tty.usbmodem5C821087231` is the **leader** and `/dev/tty.usbmodem5C821094831` is the
+`/dev/tty.usbmodem5C821071271` is the **leader** and `/dev/tty.usbmodem5C821094831` is the
 **follower** on this bench. The names alone do not tell you which cable is which;
 answer is `lerobot-find-port`, which has you unplug a cable and compare listings.
 This is the same question asked the other way round: watch both ports at once,

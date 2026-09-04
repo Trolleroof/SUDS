@@ -116,6 +116,49 @@ def _ease_out_cubic(t: float) -> float:
     """0..1 in, 0..1 out: fast start, soft arrival instead of a dead stop."""
     return 1.0 - (1.0 - t) ** 3
 
+
+def safe_build_dataset_frame(
+    ds_features: dict[str, dict],
+    values: dict[str, Any],
+    prefix: str,
+    default_pose: dict[str, float] | None = None,
+) -> dict[str, np.ndarray]:
+    """Construct a dataset frame that is guaranteed to match the dataset features schema."""
+    import cv2
+
+    frame = {}
+    default_pose = default_pose or {}
+    for key, ft in ds_features.items():
+        if key in ("timestamp", "frame_index", "episode_index", "index", "task_index") or not key.startswith(prefix):
+            continue
+        if ft["dtype"] == "float32" and len(ft["shape"]) == 1:
+            joint_values = []
+            for name in ft["names"]:
+                val = values.get(name)
+                if val is None and name.endswith(".pos"):
+                    val = values.get(name[:-4])
+                elif val is None:
+                    val = values.get(f"{name}.pos")
+                if val is None or not isinstance(val, (int, float, np.number)):
+                    clean_name = name[:-4] if name.endswith(".pos") else name
+                    val = default_pose.get(clean_name, 0.0)
+                joint_values.append(float(val))
+            frame[key] = np.array(joint_values, dtype=np.float32)
+        elif ft["dtype"] in ["image", "video"]:
+            cam_name = key.removeprefix(f"{prefix}.images.")
+            expected_shape = tuple(ft["shape"])
+            img = values.get(cam_name)
+            if img is None or not isinstance(img, np.ndarray) or img.ndim != 3:
+                img = np.zeros(expected_shape, dtype=np.uint8)
+            elif img.shape != expected_shape:
+                h, w = expected_shape[0], expected_shape[1]
+                img = cv2.resize(img, (w, h))
+            if img.dtype != np.uint8:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            frame[key] = np.ascontiguousarray(img)
+    return frame
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("recorder")
 
@@ -694,7 +737,13 @@ class Recorder:
             if key not in obs_dict:
                 obs_dict[key] = float(self._last_robot_pos.get(key, REST_POSE.get(m, 0.0)))
 
-        for cam_key in self.camera_meta.keys():
+        expected_cams = {
+            k.removeprefix(f"{OBS_STR}.images.")
+            for k, ft in getattr(getattr(self, "dataset", None), "features", {}).items()
+            if k.startswith(f"{OBS_STR}.images.") and ft.get("dtype") in ("image", "video")
+        }
+        all_cam_keys = set(self.camera_meta.keys()) | expected_cams
+        for cam_key in all_cam_keys:
             cam = (getattr(self.robot, "cameras", {}) or {}).get(cam_key)
             obs_dict[cam_key] = self._get_camera_frame(cam_key, cam)
 
@@ -746,14 +795,17 @@ class Recorder:
             if sent is None:
                 sent = self._read_teleop_action()
             try:
-                obs_frame = build_dataset_frame(self.dataset.features, observation, prefix=OBS_STR)
-                act_frame = build_dataset_frame(self.dataset.features, sent, prefix=ACTION)
-                frame = {**obs_frame, **act_frame, "task": self.task}
+                obs_frame = safe_build_dataset_frame(self.dataset.features, observation, prefix=OBS_STR, default_pose=REST_POSE)
+                act_frame = safe_build_dataset_frame(self.dataset.features, sent, prefix=ACTION, default_pose=START_POSE)
+                task_str = str(self.task or "default")
+                frame = {**obs_frame, **act_frame, "task": task_str}
                 self.dataset.add_frame(frame)
                 with self.lock:
                     self.frames += 1
             except Exception as err:  # noqa: BLE001
                 log.error("could not record frame to dataset: %s", err)
+                with self.lock:
+                    self.last_message = f"frame error: {err}"
 
         with self.lock:
             expired = self.state == PENDING and time.time() >= self.commit_at
@@ -873,11 +925,11 @@ class Recorder:
                 self._save()
             self._begin()
         elif command == "stop":
-            with self.lock:
-                self.state = SAVING
-                self.last_message = "returning to neutral…"
             self._rest_and_release()
-            self._save()
+            if self.commit_seconds > 0:
+                self._pend()
+            else:
+                self._save()
         elif command == "discard":
             self._discard()
         elif command == "save":
@@ -937,7 +989,9 @@ class Recorder:
 
         try:
             self.dataset.save_episode()
-            self.dataset = reopen(self.dataset)
+            new_ds = reopen(self.dataset)
+            with self.lock:
+                self.dataset = new_ds
         except Exception as err:  # noqa: BLE001
             with self.lock:
                 self.state = IDLE
@@ -1216,42 +1270,56 @@ def ws_frame(payload: bytes, opcode: int = 0x1) -> bytes:
     return bytes(header) + payload
 
 
-def ws_read_opcode(sock: socket.socket) -> int | None:
-    """Opcode of one waiting client frame, or None if nothing is pending.
+def ws_read_opcode(sock: socket.socket) -> tuple[int | None, bytes]:
+    """Opcode and payload of one waiting client frame, or (None, b"") if nothing is pending.
 
-    Client frames are always masked; the payload is read and dropped, since the
-    only ones that matter are close (0x8) and ping (0x9).
+    Client frames are always masked; close (0x8) and ping (0x9) are handled.
     """
     try:
         first = sock.recv(2)
     except (BlockingIOError, TimeoutError):
-        return None
-    except OSError:
-        return 0x8
+        return None, b""
+    except OSError as e:
+        if getattr(e, "errno", None) in (11, 35):
+            return None, b""
+        return 0x8, b""
+    if len(first) == 0:
+        return 0x8, b""
     if len(first) < 2:
-        return 0x8
+        return None, b""
 
     opcode = first[0] & 0x0F
-    masked = first[1] & 0x80
+    masked = bool(first[1] & 0x80)
     length = first[1] & 0x7F
+    payload = b""
     try:
         if length == 126:
             length = struct.unpack("!H", recv_exactly(sock, 2))[0]
         elif length == 127:
             length = struct.unpack("!Q", recv_exactly(sock, 8))[0]
-        if masked:
-            recv_exactly(sock, 4)
+        mask_key = recv_exactly(sock, 4) if masked else b""
         if length:
-            recv_exactly(sock, length)
+            raw = recv_exactly(sock, length)
+            if masked:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(raw))
+            else:
+                payload = raw
     except OSError:
-        return 0x8
-    return opcode
+        return 0x8, b""
+    return opcode, payload
 
 
 def recv_exactly(sock: socket.socket, count: int) -> bytes:
     chunks = []
     while count:
-        chunk = sock.recv(count)
+        try:
+            chunk = sock.recv(count)
+        except (BlockingIOError, TimeoutError):
+            continue
+        except OSError as e:
+            if getattr(e, "errno", None) in (11, 35):
+                continue
+            raise
         if not chunk:
             raise OSError("connection closed")
         chunks.append(chunk)
@@ -1335,16 +1403,26 @@ def make_handler(recorder: Recorder):
             sock.settimeout(0.01)
             try:
                 while True:
-                    payload = json.dumps(recorder.status()).encode()
-                    sock.settimeout(None)
-                    sock.sendall(ws_frame(payload))
-                    sock.settimeout(0.01)
+                    try:
+                        payload = json.dumps(recorder.status()).encode()
+                        sock.settimeout(None)
+                        sock.sendall(ws_frame(payload))
+                        sock.settimeout(0.01)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    except Exception as err:
+                        log.debug("websocket status push error: %s", err)
 
-                    opcode = ws_read_opcode(sock)
+                    opcode, client_payload = ws_read_opcode(sock)
                     if opcode == 0x8:
                         break
                     if opcode == 0x9:
-                        sock.sendall(ws_frame(b"", opcode=0xA))
+                        try:
+                            sock.settimeout(None)
+                            sock.sendall(ws_frame(client_payload, opcode=0xA))
+                            sock.settimeout(0.01)
+                        except Exception:
+                            break
                     time.sleep(WS_PERIOD)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
