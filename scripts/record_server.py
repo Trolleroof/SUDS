@@ -969,6 +969,7 @@ class Recorder:
             self.dataset.clear_episode_buffer()
         except Exception as err:
             log.warning("could not clear episode buffer: %s", err)
+        self._rest_and_release()
         with self.lock:
             self.state = IDLE
             self.frames = 0

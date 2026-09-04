@@ -3,20 +3,12 @@ import path from "node:path";
 
 import { labelsFile } from "./paths";
 
-export const VERDICTS = ["pass", "fail", "discard"] as const;
+export const VERDICTS = ["pass", "discard"] as const;
 export type Verdict = (typeof VERDICTS)[number];
-
-/**
- * Grow this list as real failures show up -- an enum you can count beats free
- * text when you are trying to work out *why* a policy is at 40%. Defined in
- * api-types so the client can render the same list without importing node code.
- */
-export { FAILURE_MODES } from "./api-types";
 
 export type Label = {
   episode_index: number;
   verdict: Verdict;
-  failure_mode?: string | null;
   notes?: string | null;
   labeled_at: string;
 };
@@ -37,7 +29,17 @@ export async function readLabels(repoId: string): Promise<Map<number, Label>> {
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     try {
-      const label = JSON.parse(line) as Label;
+      const raw = JSON.parse(line) as { episode_index: number; verdict: string; notes?: string | null; labeled_at: string };
+      let verdict: Verdict;
+      if (raw.verdict === "pass") verdict = "pass";
+      else if (raw.verdict === "discard" || raw.verdict === "fail") verdict = "discard";
+      else continue;
+      const label: Label = {
+        episode_index: raw.episode_index,
+        verdict,
+        notes: raw.notes ?? null,
+        labeled_at: raw.labeled_at,
+      };
       out.set(label.episode_index, label);
     } catch {
       // A torn final line (killed mid-write) should not blank the dashboard.

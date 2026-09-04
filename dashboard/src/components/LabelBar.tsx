@@ -2,14 +2,14 @@
 
 import { useEffect, useState } from "react";
 
-import { FAILURE_MODES, type EpisodeRow, type Verdict } from "@/lib/api-types";
+import type { EpisodeRow, Verdict } from "@/lib/api-types";
 
 export default function LabelBar({
   episode,
   onLabel,
 }: {
   episode: EpisodeRow;
-  onLabel: (verdict: Verdict, patch?: { failure_mode?: string | null; notes?: string | null }) => Promise<void>;
+  onLabel: (verdict: Verdict, patch?: { notes?: string | null }) => Promise<void>;
 }) {
   const [notes, setNotes] = useState(episode.label?.notes ?? "");
 
@@ -25,7 +25,7 @@ export default function LabelBar({
     <section className="panel">
       <h2>Verdict</h2>
       <div className="inner label-bar">
-        {(["pass", "fail", "discard"] as Verdict[]).map((v) => (
+        {(["pass", "discard"] as Verdict[]).map((v) => (
           <button
             key={v}
             className={`verdict ${v}`}
@@ -35,20 +35,6 @@ export default function LabelBar({
             {v}
           </button>
         ))}
-
-        <select
-          className="modes"
-          value={episode.label?.failure_mode ?? ""}
-          disabled={verdict !== "fail"}
-          onChange={(e) => void onLabel("fail", { failure_mode: e.target.value || null })}
-        >
-          <option value="">failure mode…</option>
-          {FAILURE_MODES.map((mode) => (
-            <option key={mode} value={mode}>
-              {mode}
-            </option>
-          ))}
-        </select>
 
         <input
           className="notes"

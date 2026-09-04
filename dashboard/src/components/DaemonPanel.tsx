@@ -10,7 +10,7 @@ import {
   resolveArmPorts,
   shortPort,
 } from "@/lib/arm-ports";
-import { resolveCameras } from "@/lib/camera-ports";
+import { resolveCameras, sortCamerasForDisplay } from "@/lib/camera-ports";
 import { useArmsConfig } from "@/lib/use-arms-config";
 import { useCamerasConfig } from "@/lib/use-cameras-config";
 
@@ -372,7 +372,7 @@ export default function DaemonPanel({
           <div className="setup-row setup-row-top">
             <span className="setup-label">Cameras</span>
             <div className="camera-list">
-              {config.cameras.map((camera) => (
+              {sortCamerasForDisplay(config.cameras, (camera) => camera.name).map((camera) => (
                 <div className="camera-row locked" key={camera.name}>
                   <span className="camera-name-locked">{camera.name}</span>
                   <span className="slot-badge">index {camera.index}</span>

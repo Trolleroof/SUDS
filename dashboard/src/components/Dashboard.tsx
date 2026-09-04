@@ -16,11 +16,10 @@ import LiveCameras from "./LiveCameras";
 import RecordBar from "./RecordBar";
 import SafetyBar from "./SafetyBar";
 import StatsStrip from "./StatsStrip";
-import TeleopSyncPanel from "./TeleopSyncPanel";
 import TracePanel from "./TracePanel";
 import VideoPanel from "./VideoPanel";
 
-type Filter = "all" | "unlabeled" | "pass" | "fail" | "discard";
+type Filter = "all" | "unlabeled" | "pass" | "discard";
 
 /**
  * Two jobs, two screens.
@@ -109,11 +108,7 @@ export default function Dashboard({
   );
 
   const labelEpisode = useCallback(
-    async (
-      episode: EpisodeRow,
-      verdict: Verdict,
-      patch: { failure_mode?: string | null; notes?: string | null } = {},
-    ) => {
+    async (episode: EpisodeRow, verdict: Verdict, patch: { notes?: string | null } = {}) => {
       const previous = episode.label;
       await fetch("/api/label", {
         method: "POST",
@@ -123,7 +118,6 @@ export default function Dashboard({
           episode_index: episode.episode_index,
           verdict,
           // Relabelling should not silently drop the notes already written.
-          failure_mode: patch.failure_mode !== undefined ? patch.failure_mode : previous?.failure_mode ?? null,
           notes: patch.notes !== undefined ? patch.notes : previous?.notes ?? null,
         }),
       });
@@ -133,7 +127,7 @@ export default function Dashboard({
   );
 
   const label = useCallback(
-    async (verdict: Verdict, patch: { failure_mode?: string | null; notes?: string | null } = {}) => {
+    async (verdict: Verdict, patch: { notes?: string | null } = {}) => {
       if (!current) return;
       await labelEpisode(current, verdict, patch);
     },
@@ -161,7 +155,6 @@ export default function Dashboard({
         ArrowDown: () => step(1),
         ArrowUp: () => step(-1),
         p: () => void label("pass"),
-        f: () => void label("fail"),
         d: () => void label("discard"),
       };
       const handler = handlers[event.key];
@@ -203,7 +196,7 @@ export default function Dashboard({
         {view === "review" && (
         <aside className="sidebar">
           <div className="filters">
-            {(["all", "unlabeled", "pass", "fail", "discard"] as Filter[]).map((f) => (
+            {(["all", "unlabeled", "pass", "discard"] as Filter[]).map((f) => (
               <button
                 key={f}
                 className="chip"
@@ -239,7 +232,6 @@ export default function Dashboard({
                 <RecordBar recorder={recorder} />
               </div>
 
-              {recorderUp && <TeleopSyncPanel recorder={recorder} />}
               {recorderUp && <LiveCameras recorder={recorder} />}
               <CalibrationPanel recorderOnline={recorderUp} />
               {!recorderUp && (

@@ -1,11 +1,10 @@
 /** Shapes returned by /api/*, shared with the client. No node imports here. */
 
-export type Verdict = "pass" | "fail" | "discard";
+export type Verdict = "pass" | "discard";
 
 export type Label = {
   episode_index: number;
   verdict: Verdict;
-  failure_mode?: string | null;
   notes?: string | null;
   labeled_at: string;
 };
@@ -89,18 +88,6 @@ export type HardwarePayload = {
   offline?: boolean;
   error?: string;
 };
-
-export const FAILURE_MODES = [
-  "missed_grasp",
-  "dropped",
-  "wrong_object",
-  "teleop_jerk",
-  "occlusion",
-  "out_of_frame",
-  "collision",
-  "timeout",
-  "other",
-] as const;
 
 /* ---- recorder daemon (scripts/record_server.py) ---------------------- */
 

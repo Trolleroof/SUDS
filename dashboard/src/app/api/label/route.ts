@@ -18,7 +18,6 @@ export async function POST(request: Request) {
   const label: Label = {
     episode_index: index,
     verdict: verdict as Verdict,
-    failure_mode: body.failure_mode ?? null,
     notes: body.notes ?? null,
     labeled_at: new Date().toISOString(),
   };
