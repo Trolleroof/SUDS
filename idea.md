@@ -5,7 +5,7 @@
 SUDS asks one concrete question:
 
 > Can a rough MuJoCo clone plus simulated data reduce the number of physical
-> dish-rinsing demonstrations required to fine-tune GROOT for the real SO-101?
+> dish-rinsing demonstrations required to fine-tune GR00T N1.7 for the real SO-101?
 
 Teleoperation is not the end product. It is the controlled source of scarce,
 high-quality real data used to answer that question.
@@ -23,9 +23,11 @@ repeatable success test.
 
 ## The experiment
 
-Fine-tune the same GROOT base checkpoint in every condition. Keep model
+Fine-tune the same GR00T N1.7 base checkpoint
+(`nvidia/GR00T-N1.7-3B`) in every condition. Keep model
 selection, camera input, action representation, training budget, and physical
-test protocol fixed.
+test protocol fixed. The launch configuration for every condition lives in
+[`docs/FINETUNE_RUNBOOK.md`](docs/FINETUNE_RUNBOOK.md).
 
 | Condition | Real demonstrations | Simulated demonstrations |
 | --- | ---: | ---: |
@@ -52,12 +54,12 @@ episodes:
 1. Calibrate the follower and camera; lock the tray, dish holder, and camera.
 2. Teleoperate clean rinse trajectories and review each take pass/fail.
 3. Save a frozen real training pool, then create deterministic 5/10/20/40-demo
-   subsets.
+   subsets (`scripts/make_subsets.py`).
 4. Reserve separate, never-trained-on physical placements for evaluation.
 
 The recorded camera feature names are part of the model contract. Do not rename
 an established dataset’s observation fields when switching between recording,
-simulation, and GROOT fine-tuning.
+simulation, and GR00T fine-tuning.
 
 ## Rough digital twin
 

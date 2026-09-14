@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { Recorder } from "@/lib/use-recorder";
 import { sortCamerasForDisplay } from "@/lib/camera-ports";
@@ -18,12 +18,29 @@ import { sortCamerasForDisplay } from "@/lib/camera-ports";
  */
 export default function LiveCameras({ recorder }: { recorder: Recorder }) {
   const { status } = recorder;
-  const cameras = sortCamerasForDisplay(status?.cameras ?? [], (name) => name);
+  // A control-loop hiccup (e.g. an arm read blocking on a dead port when the
+  // bot gets unplugged) can flip `status.offline` for a couple of seconds even
+  // though the cameras -- which run their own capture thread with their own
+  // reconnect logic -- never stopped. Remembering the last camera list means a
+  // blip pauses the status chrome, not the whole grid.
+  const lastCameras = useRef<string[]>([]);
+  if (status && !status.offline && status.cameras.length) lastCameras.current = status.cameras;
+  const cameras = sortCamerasForDisplay(status?.offline ? lastCameras.current : (status?.cameras ?? []), (name) => name);
   const [focus, setFocus] = useState<string | null>(null);
   // Bumping this remounts the <img>, which is how you restart an MJPEG stream.
   const [nonce, setNonce] = useState(0);
   const [failed, setFailed] = useState<Record<string, boolean>>({});
   const [live, setLive] = useState(true);
+  const [fullscreen, setFullscreen] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullscreen(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
 
   const reload = useCallback(() => {
     setFailed({});
@@ -31,13 +48,24 @@ export default function LiveCameras({ recorder }: { recorder: Recorder }) {
   }, []);
 
   // A daemon restart drops every open stream; reconnect rather than leaving the
-  // panel showing a broken image until someone clicks.
+  // panel showing a broken image until someone clicks. Only bump the streams
+  // themselves on the offline -> online edge, not on every render, so a
+  // transient blip (arm unplugged, control loop briefly stalled) doesn't
+  // touch the <img> tags at all -- they keep streaming right through it.
+  const wasOffline = useRef(false);
   useEffect(() => {
-    if (!status?.offline) return;
-    setFailed({});
+    if (status?.offline) {
+      wasOffline.current = true;
+      return;
+    }
+    if (wasOffline.current) {
+      wasOffline.current = false;
+      setFailed({});
+      setNonce((n) => n + 1);
+    }
   }, [status?.offline]);
 
-  if (!status || status.offline) return null;
+  if (!status) return null;
 
   if (cameras.length === 0) {
     return (
@@ -50,8 +78,6 @@ export default function LiveCameras({ recorder }: { recorder: Recorder }) {
       </section>
     );
   }
-
-  const shown = focus ? cameras.filter((name) => name === focus) : cameras;
 
   return (
     <section className="panel live">
@@ -72,12 +98,26 @@ export default function LiveCameras({ recorder }: { recorder: Recorder }) {
           <button className="verdict" onClick={reload}>
             Reconnect
           </button>
-          <span className="hint">{live ? "streaming from the recorder" : "frozen — last frame held"}</span>
+          <span className="hint">
+            {status.offline
+              ? "recorder reconnecting — streams held"
+              : live
+                ? "streaming from the recorder"
+                : "frozen — last frame held"}
+          </span>
         </div>
 
+        {/* Every camera stays mounted for the life of the panel. Focus and
+            fullscreen are styling, never unmounting: an <img> that leaves the
+            tree drops its MJPEG connection, and the one it opens on the way
+            back shows black until the next frame arrives. */}
         <div className={`live-grid ${focus ? "focused" : ""}`}>
-          {shown.map((name) => (
-            <figure key={name} className="live-card">
+          {cameras.map((name) => (
+            <figure
+              key={name}
+              className={`live-card${fullscreen === name ? " fullscreen" : ""}`}
+              hidden={Boolean(focus) && focus !== name && fullscreen !== name}
+            >
               <figcaption>
                 <span className="cam">{name}</span>
                 <span className={`dot ${status.hardware?.cameras?.[name]?.status ?? "offline"}`} aria-hidden />
@@ -95,18 +135,34 @@ export default function LiveCameras({ recorder }: { recorder: Recorder }) {
                   key={`${name}-${nonce}-${live}`}
                   className="live-frame"
                   alt={`${name} camera`}
+                  title={fullscreen === name ? "Click to exit fullscreen" : "Click to view fullscreen"}
                   src={
                     live
                       ? `/api/stream/${encodeURIComponent(name)}?n=${nonce}`
                       : `/api/stream/${encodeURIComponent(name)}?mode=snapshot&n=${nonce}`
                   }
                   onError={() => setFailed((prev) => ({ ...prev, [name]: true }))}
+                  onClick={() => setFullscreen((current) => (current === name ? null : name))}
                 />
               )}
             </figure>
           ))}
         </div>
       </div>
+
+      {fullscreen && !failed[fullscreen] && (
+        <div className="live-frame-scrim" onClick={() => setFullscreen(null)}>
+          <button
+            className="live-frame-scrim-close"
+            onClick={(e) => {
+              e.stopPropagation();
+              setFullscreen(null);
+            }}
+          >
+            Close
+          </button>
+        </div>
+      )}
     </section>
   );
 }

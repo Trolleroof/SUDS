@@ -232,7 +232,7 @@ export default function Dashboard({
                 <RecordBar recorder={recorder} />
               </div>
 
-              {recorderUp && <LiveCameras recorder={recorder} />}
+              <LiveCameras recorder={recorder} />
               <CalibrationPanel recorderOnline={recorderUp} />
               {!recorderUp && (
                 <p className="empty">

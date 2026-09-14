@@ -12,14 +12,30 @@ export default function SafetyBar({ recorder }: { recorder: Recorder }) {
 
   const estop = status.estop;
 
+  async function stopTeleopAndRecord() {
+    // The daemon refuses disengage while a take is open, so stop first.
+    // `stop` parks the follower and opens the commit window; `save` writes it.
+    let next = status;
+    if (next?.state === "recording") {
+      next = (await send("stop")) ?? next;
+    }
+    if (next?.state === "pending") {
+      next = (await send("save")) ?? next;
+    }
+    if (next?.teleop?.engaged !== false) {
+      await send("disengage");
+    }
+  }
+
   return (
     <section className={`panel safety ${estop.engaged ? "engaged" : ""}`}>
       <div className="inner safety-bar">
         {!estop.engaged ? (
           <button
             className="kill"
-            onClick={() => void send("estop", { reason: "operator" })}
-            title="Cut servo torque on both arms immediately"
+            disabled={busy}
+            onClick={() => void stopTeleopAndRecord()}
+            title="Stop teleop and save the current take"
           >
             <span className="glyph" aria-hidden>
               ⏻

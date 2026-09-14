@@ -110,7 +110,7 @@ so no remapping is needed.
 ### Build the cell clone before generating data
 
 SUDS uses MuJoCo to test whether simulated data reduces the number of real
-demonstrations needed to fine-tune GROOT. Start from the supplied SO-101 scene;
+demonstrations needed to fine-tune GR00T N1.7. Start from the supplied SO-101 scene;
 do not make a second robot model. Add a tray, dish holder, dish, and the
 overhead camera, all measured from the physical cell.
 

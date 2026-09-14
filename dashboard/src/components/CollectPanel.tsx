@@ -31,6 +31,16 @@ export default function CollectPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [nonce, setNonce] = useState(0);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
 
   const poll = useCallback(async () => {
     try {
@@ -155,7 +165,9 @@ export default function CollectPanel() {
               key={nonce}
               className="live-frame"
               alt="Handheld wrist camera"
+              title="Click to view fullscreen"
               src={`/api/camera/${WRIST}?n=${nonce}`}
+              onClick={() => setFullscreen(true)}
             />
           ) : (
             <div className="live-frame placeholder">
@@ -171,6 +183,27 @@ export default function CollectPanel() {
             </div>
           )}
         </figure>
+
+        {fullscreen && running && (
+          <div className="live-frame-scrim" onClick={() => setFullscreen(false)}>
+            <button
+              className="live-frame-scrim-close"
+              onClick={(e) => {
+                e.stopPropagation();
+                setFullscreen(false);
+              }}
+            >
+              Close
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element -- MJPEG */}
+            <img
+              key={nonce}
+              className="live-frame-full"
+              alt="Handheld wrist camera fullscreen"
+              src={`/api/camera/${WRIST}?n=${nonce}`}
+            />
+          </div>
+        )}
       </div>
     </section>
   );

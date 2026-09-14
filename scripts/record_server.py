@@ -570,7 +570,9 @@ class Recorder:
         gently, glides smoothly, and decelerates softly into target pose.
         Caller holds `hw_lock`.
         """
-        observation = self.robot.get_observation()
+        # Joints only. `robot.get_observation()` also calls `cam.read_latest()`,
+        # and a dead wrist thread (OpenCVCamera(1)) would abort the whole engage.
+        observation = self._read_robot_observation()
         current = {
             key: float(value)
             for key, value in observation.items()
@@ -1132,12 +1134,18 @@ class Recorder:
         either way, and JPEG-encoding two 640×480 frames 30 times a second buys
         nothing a browser can show.
         """
-        if not observation:
-            return
         now = time.time()
         if now - self._stream_at < self._stream_period:
             return
         self._stream_at = now
+
+        # A tick that produced no observation -- a dropped USB packet, or the
+        # bot unplugged entirely -- still has cameras worth watching: they run
+        # their own capture threads and know nothing about the motor bus. Fall
+        # back to their frames rather than publishing none, which would stall
+        # every open MJPEG stream on an arm fault and black the panel out.
+        if not observation:
+            observation = self._camera_only_observation()
 
         encoded: dict[str, bytes] = {}
         for name in self.camera_meta:

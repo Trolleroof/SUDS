@@ -91,7 +91,12 @@ export function useRecorder({
         /* listener error */
       }
     });
-    handlers.current.onRepoId?.(next.repo_id);
+    // An offline status carries no repo_id -- it is the OFFLINE placeholder, not
+    // a daemon telling us it switched datasets. Broadcasting the empty string
+    // clears whichever dataset is selected, and every <video> src rebuilds as
+    // `repo_id=`, which the video route answers 400 and the player renders
+    // black. Reviewing recordings must not depend on the daemon being up.
+    if (next.repo_id) handlers.current.onRepoId?.(next.repo_id);
     // Refresh the episode list exactly when a take lands, not on a timer.
     if (savedCount.current !== null && next.saved_episodes > savedCount.current) {
       handlers.current.onEpisodeSaved?.();

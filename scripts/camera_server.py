@@ -113,14 +113,21 @@ class Cameras:
                 self.cv.notify_all()
 
     def _reconnect(self, name: str) -> None:
-        cam = self.cameras[name]
+        # Runs off the step() thread: cam.connect(warmup=True) blocks for up to
+        # warmup_s waiting on a frame (the exact "Timed out waiting for frame"
+        # error a stalled webcam throws), and step() drives every camera, so a
+        # blocking reconnect here freezes every other camera's stream too.
         self.failed_at[name] = time.time()
+        threading.Thread(target=self._reconnect_worker, args=(name,), daemon=True).start()
+
+    def _reconnect_worker(self, name: str) -> None:
+        cam = self.cameras[name]
         try:
             cam.disconnect()
         except Exception:  # noqa: BLE001
             pass
         try:
-            cam.connect()
+            cam.connect(warmup=False)
         except Exception as err:  # noqa: BLE001
             self.errors[name] = str(err)
             return

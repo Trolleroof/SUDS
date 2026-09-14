@@ -22,7 +22,7 @@ writes: the verdicts.
 Because `lerobot-record --policy.path=...` writes rollouts in the *same* format,
 pointing the picker at the held-out physical eval dataset gives you autonomous
 success rate with no extra work. For SUDS, compare that rate across frozen real
-demo budgets (5/10/20/40) for real-only and sim+real GROOT fine-tuning. Keep
+demo budgets (5/10/20/40) for real-only and sim+real GR00T fine-tuning. Keep
 simulated data out of this picker: the claim is reduced *physical* data need,
 not simulated success.
 

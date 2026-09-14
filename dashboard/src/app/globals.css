@@ -173,6 +173,47 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .video-card { flex: 1 1 300px; min-width: 240px; }
 .video-card video { width: 100%; border-radius: 10px; background: #000; display: block; }
 .video-card .cam { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.video-card video { cursor: pointer; }
+
+/* One transport for every camera in the panel — the clips are windows into
+   different files, so a per-video scrubber would disagree with its neighbour. */
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.transport-play,
+.transport-step {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text);
+  cursor: pointer;
+}
+.transport-play { padding: 7px 12px; min-width: 38px; }
+.transport-step { padding: 7px 10px; }
+.transport-play:hover,
+.transport-step:hover { background: var(--line-soft); }
+.transport-scrub {
+  flex: 1 1 auto;
+  min-width: 120px;
+  accent-color: var(--text);
+  cursor: pointer;
+}
+.transport-time,
+.transport-frame {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
 
 /* ---- labelling ------------------------------------------------------- */
 
@@ -570,10 +611,11 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
 .live-frame {
   width: 100%;
   aspect-ratio: 4 / 3;
-  object-fit: cover;
+  object-fit: contain;
   border-radius: 10px;
   background: #000;
   display: block;
+  cursor: zoom-in;
 }
 .live-frame.placeholder {
   display: flex;
@@ -582,6 +624,54 @@ svg text { font-family: var(--sans); font-size: 10px; fill: var(--faint); }
   color: var(--faint);
   font-size: 12px;
   border: 1px dashed var(--line);
+  cursor: default;
+}
+
+.live-frame-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  cursor: zoom-out;
+}
+/* Fullscreen lifts the existing card over the scrim rather than rendering a
+   second <img>, which would open a second MJPEG connection to the same
+   camera. Same element, same stream, no reconnect on the way in or out. */
+.live-card.fullscreen {
+  position: fixed;
+  inset: 24px;
+  z-index: 101;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  pointer-events: none;
+}
+.live-card.fullscreen figcaption { color: #fff; text-align: center; }
+.live-card.fullscreen .live-frame {
+  width: auto;
+  max-width: 100%;
+  max-height: calc(100vh - 96px);
+  margin: 0 auto;
+  aspect-ratio: auto;
+  border-radius: 8px;
+  cursor: zoom-out;
+  pointer-events: auto;
+}
+.live-frame-scrim-close {
+  position: absolute;
+  top: 16px;
+  right: 20px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.15);
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
 }
 
 /* ---- calibration ----------------------------------------------------- */

@@ -60,6 +60,16 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
   const [identified, setIdentified] = useState<string | null>(null);
   const [identifyNote, setIdentifyNote] = useState<string | null>(null);
   const [portWarning, setPortWarning] = useState<string | null>(null);
+  const [fullscreenCam, setFullscreenCam] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!fullscreenCam) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFullscreenCam(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreenCam]);
 
   // Permanent ports from config/arms.json — no rescan required on load.
   useEffect(() => {
@@ -355,7 +365,9 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
                     <img
                       className="live-frame"
                       alt={`${camera.name} camera`}
+                      title="Click to view fullscreen"
                       src={`/api/camera/${encodeURIComponent(camera.name)}`}
+                      onClick={() => setFullscreenCam(camera.name)}
                     />
                   ) : (
                     <div className="live-frame placeholder">
@@ -366,6 +378,26 @@ export default function CommandBar({ recorderRunning }: { recorderRunning: boole
                 </figure>
               ),
             )}
+          </div>
+        )}
+
+        {fullscreenCam && (
+          <div className="live-frame-scrim" onClick={() => setFullscreenCam(null)}>
+            <button
+              className="live-frame-scrim-close"
+              onClick={(e) => {
+                e.stopPropagation();
+                setFullscreenCam(null);
+              }}
+            >
+              Close
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element -- MJPEG */}
+            <img
+              className="live-frame-full"
+              alt={`${fullscreenCam} camera fullscreen`}
+              src={`/api/camera/${encodeURIComponent(fullscreenCam)}`}
+            />
           </div>
         )}
       </div>
