@@ -84,13 +84,12 @@ eight conditions.
 ## 1. Prepare the data (already done, local)
 
 ```bash
-python scripts/make_subsets.py --dataset suds__live_2   # frozen pool + 5/10/20/40 subsets
-python scripts/preflight.py                             # GR00T contract check
+python scripts/preflight.py  # checks suds/live_2_corrected by default
 ```
 
-`make_subsets.py` collapses the dashboard's append-only label log (last write
-wins) into a frozen 46-episode pool and cuts nested 5/10/20/40 subsets under seed
-1000, so a budget difference is only ever *more* data, never different data.
+The corrected snapshot retains the 46 passed episodes, fixes the switched camera
+labels, and uses the task `pick up the yellow sponge`. The exact pool is stored in
+`datasets/suds__live_2.policy_train.json`.
 
 `preflight.py` currently passes every check with no warnings.
 
@@ -102,7 +101,7 @@ hf auth login
 wandb login
 ```
 
-Copy the dataset to the box at `~/.cache/huggingface/lerobot/suds/live_2`, or
+Copy the dataset to the box at `~/.cache/huggingface/lerobot/suds/live_2_corrected`, or
 point `--dataset.root` wherever it lands.
 
 GR00T N1.5 is **removed** from LeRobot; N1.5 checkpoints and configs are rejected
@@ -116,7 +115,7 @@ memory errors in minutes instead of hours.
 ```bash
 lerobot-train \
   --dataset.repo_id=suds/live_2 \
-  --dataset.root=$HOME/.cache/huggingface/lerobot/suds/live_2 \
+  --dataset.root=$HOME/.cache/huggingface/lerobot/suds/live_2_corrected \
   --dataset.episodes='[19,22,24,39,45]' \
   --dataset.image_transforms.enable=true \
   --policy.type=groot \
@@ -143,7 +142,21 @@ that value identical across all eight conditions.
 
 ## 4. Real run, per condition
 
-Swap `--dataset.episodes` for the subset under test:
+For the next full-data policy, train on all 46 corrected, accepted episodes:
+
+```bash
+  --dataset.root=$HOME/.cache/huggingface/lerobot/suds/live_2_corrected \
+  --dataset.episodes='[1,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,24,25,28,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,51,52,53]' \
+  --steps=20000 \
+  --batch_size=32 \
+  --save_checkpoint=true --save_freq=5000 \
+  --use_policy_training_preset=true \
+  --wandb.enable=true --wandb.disable_artifact=true \
+  --output_dir=outputs/train/groot_real46 \
+  --job_name=groot_real46
+```
+
+For the data-scaling experiment, swap `--dataset.episodes` for a frozen subset:
 
 ```bash
   --dataset.episodes='[1,5,6,12,15,16,19,20,21,22,24,31,33,37,39,42,43,45,47,48]' \
@@ -249,3 +262,41 @@ physical trials on placements never trained on, scored with the rubric in
 pose reached. Record success, collision, time-to-completion and failure category.
 Simulated data may train a policy and help pick variants; it never enters the
 physical evaluation set.
+
+## UMI-style passive gripper capture
+
+Keep handheld captures in a new dataset; do not append them directly to
+`suds/live_2_corrected`. That dataset's GR00T contract is two 30 FPS camera
+streams plus the six SO-101 values named in `scripts/preflight.py`.
+
+The offline conversion path is:
+
+```text
+wrist video -> ORB-SLAM3 camera_trajectory.csv -> scripts/umi_slam_sidecar.py
+jaw ArUco markers -> scripts/gripper_vision.py -> open/closed/unknown
+TCP pose + gripper state -> SO-101 inverse kinematics -> six joint/gripper values
+six values + wrist/overhead frames -> LeRobot v3 dataset -> scripts/preflight.py
+```
+
+Use the official UMI ORB-SLAM3 pipeline to produce `camera_trajectory.csv`.
+`umi_slam_sidecar.py` applies measured `base_from_slam` and `camera_to_tcp`
+transforms and emits metric TCP position plus rotation-vector columns. Raw SLAM
+coordinates are diagnostic sidecar data, not GR00T state/action values.
+
+The conversion is trainable only after every TCP pose has a continuous,
+in-bounds SO-101 IK solution. Write those solved values under the existing names:
+
+```text
+shoulder_pan.pos, shoulder_lift.pos, elbow_flex.pos,
+wrist_flex.pos, wrist_roll.pos, gripper.pos
+```
+
+Then retain the current GR00T options: `new_embodiment`, 30 FPS,
+`use_relative_actions=true`, and `relative_exclude_joints=["gripper"]`.
+`scripts/preflight.py` remains the final format gate.
+
+Physical calibration still required: camera intrinsics, a fixed metric world
+marker for `base_from_slam`, the measured camera-to-gripper-tip transform, and
+two jaw markers visible in fully-open and fully-closed reference frames. A
+monocular camera without a metric marker or IMU has unknown translation scale
+and cannot safely generate SO-101 joint targets.

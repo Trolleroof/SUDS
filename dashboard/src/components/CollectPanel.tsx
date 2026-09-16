@@ -11,6 +11,9 @@ type CamerasStatus = {
   pid: number | null;
   log: string[];
   cameras?: CameraState[];
+  gripper_vision?: boolean;
+  gripper_calibrated?: boolean;
+  gripper?: { state: "open" | "closed" | "unknown"; gap_px: number | null } | null;
   error?: string;
 };
 
@@ -57,9 +60,16 @@ export default function CollectPanel() {
     try {
       const current = await fetch("/api/run/cameras", { cache: "no-store" });
       const body = current.ok ? ((await current.json()) as CamerasStatus) : null;
-      if (body?.running) {
+      if (body?.running && body.gripper_vision) {
         setStatus(body);
         return;
+      }
+      if (body?.running) {
+        await fetch("/api/run/cameras", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "stop" }),
+        });
       }
       const res = await fetch("/api/run/cameras", {
         method: "POST",
@@ -72,6 +82,7 @@ export default function CollectPanel() {
             robotId: "follower",
             teleopId: "leader",
             cameras: [{ name: WRIST, index: wristIndex }],
+            gripperVision: { leftId: 1, rightId: 2 },
           },
         }),
       });
@@ -127,7 +138,8 @@ export default function CollectPanel() {
       <div className="inner">
         <p className="hint collect-lead">
           Handheld wrist camera only — no robot, no overhead view. This is what a
-          policy will see from the rig in your hand.
+          policy will see from the rig in your hand. Gripper vision runs only here;
+          processed SLAM paths appear in Review.
         </p>
 
         <div className="label-bar live-controls">
@@ -150,6 +162,10 @@ export default function CollectPanel() {
           <button className="verdict" onClick={() => setNonce((n) => n + 1)}>
             Reload feed
           </button>
+          <span className={`daemon-pill ${status?.gripper?.state === "unknown" ? "down" : "up"}`}>
+            gripper {status?.gripper_calibrated ? status?.gripper?.state : "uncalibrated"}
+            {status?.gripper?.gap_px != null ? ` · ${status.gripper.gap_px}px` : ""}
+          </span>
         </div>
 
         {error && <p className="cmd-error">{error}</p>}

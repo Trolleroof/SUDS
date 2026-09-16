@@ -53,7 +53,7 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
           return;
         }
         if (status?.state === "pending") {
-          void send("record");
+          void goLive();
           return;
         }
         if (!status || status.offline || status.state === "idle") {
@@ -87,40 +87,50 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
     setLocalError(null);
     setWaitHint(null);
     try {
-      let s = (await fetchRecorderHttp()) ?? status;
-      const config = await loadStartConfig();
-      const wanted = cameraKey(config.cameras);
-
-      const daemon = await fetchDaemon();
-      const runningCams = cameraKey((daemon?.config?.cameras as CameraSpec[] | undefined) ?? []);
-      const needRestart = Boolean(daemon?.running && wanted && runningCams !== wanted);
-
-      if (needRestart) {
-        setPhase("starting");
-        setWaitHint("restarting with both cameras…");
-        await postJson("/api/daemon/stop", {});
-        s = { ...(s ?? OFFLINE_STATUS), offline: true };
-      }
+      let s = status && !status.offline ? status : await fetchRecorderHttp();
+      let justStarted = false;
 
       if (!s || s.offline) {
+        const [config, daemon] = await Promise.all([loadStartConfig(), fetchDaemon()]);
+        const wanted = cameraKey(config.cameras);
+        const runningCams = cameraKey((daemon?.config?.cameras as CameraSpec[] | undefined) ?? []);
+        const needRestart = Boolean(daemon?.running && wanted && runningCams !== wanted);
+
         setPhase("starting");
         setWaitHint(`starting ${config.repoId} · ${config.cameras.map((c) => c.name).join(" + ")}…`);
+        if (needRestart) await postJson("/api/daemon/stop", {});
         if (!daemon?.running) {
-          await stopProc("cameras");
-          await stopProc("teleop");
+          await Promise.all([stopProc("cameras"), stopProc("teleop")]);
           const started = await postJson("/api/daemon/start", config);
           if (started?.ok === false && !String(started?.error ?? "").includes("already")) {
             throw new Error(started?.error ?? "failed to start recorder");
           }
+        } else if (needRestart) {
+          const started = await postJson("/api/daemon/start", config);
+          if (started?.ok === false) throw new Error(started.error ?? "failed to restart recorder");
         }
         reconnectNow();
         s = await waitForRecorderOnline(recorder, 90_000, () => cancelled.current);
+        justStarted = true;
       }
 
       throwIfCancelled();
       if (s.state === "estopped") throw new Error("arms are e-stopped — re-arm to record again");
       if (s.state === "calibrating") throw new Error("finish or cancel the calibration to record again");
       if (s.state === "recording" || s.state === "saving") return;
+
+      if (justStarted && !s.data_quality?.ready) {
+        setPhase("waiting");
+        setWaitHint("checking recorder data setup…");
+        s =
+          (await pollRecorderHttp((next) => next.data_quality?.ready === true, 5_000, () => cancelled.current)) ?? s;
+      }
+      if (!s.data_quality?.ready) {
+        throw new Error(s.data_quality?.issues.join(" · ") || "recorder data check unavailable — restart the recorder");
+      }
+
+      if (!s.teleop?.ready) setPhase("waiting");
+      s = await waitUntilReady(recorder, s, () => cancelled.current, setWaitHint);
 
       if (!s.teleop?.engaged) {
         setPhase("engaging");
@@ -129,6 +139,14 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
         if (!engaged) return;
         s = engaged;
       }
+
+      if (!s.teleop?.record_ready) {
+        setPhase("waiting");
+        setWaitHint("waiting for follower control to settle…");
+        s =
+          (await pollRecorderHttp((next) => next.teleop?.record_ready === true, 5_000, () => cancelled.current)) ?? s;
+      }
+      if (!s.teleop?.record_ready) throw new Error("follower control did not settle — check the arm connection");
 
       throwIfCancelled();
       if (s.state === "idle" || s.state === "pending") {
@@ -209,6 +227,8 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
 
   const state = (status?.state ?? (isRecording ? "recording" : "idle")) as RecorderState;
   const notEngaged = state === "idle" && status?.teleop && !status.teleop.engaged;
+  const dataReady = status?.data_quality?.ready === true;
+  const dataIssues = status?.data_quality?.issues.join(" · ") || "restart the recorder to run the data check";
 
   return (
     <section className={`panel recorder ${state}`}>
@@ -232,6 +252,10 @@ export default function RecordBar({ recorder }: { recorder: Recorder }) {
           <span className="glyph">{GLYPH[state]}</span>
           {phase !== "idle" ? PHASE_LABEL[phase] : LABEL[state]}
         </button>
+
+        <span className={`data-check ${dataReady ? "good" : "bad"}`} title={dataReady ? "task, cameras, schema and FPS verified" : dataIssues}>
+          {dataReady ? "data ready" : "fix data setup"}
+        </span>
 
         {state === "pending" && (
           <button className="verdict pass" tabIndex={-1} disabled={busy} onClick={() => void send("save")}>
@@ -440,6 +464,7 @@ async function resolveRepoId(preferred: string, cameras: CameraSpec[]): Promise<
 
 async function loadStartConfig(): Promise<DaemonConfig> {
   const stored = readStoredConfig() ?? {};
+  const storedTask = stored.task?.trim();
   let armPorts = { teleopPort: stored.teleopPort ?? null, robotPort: stored.robotPort ?? null };
   let configuredCams: CameraSpec[] = DEFAULT_CAMERAS;
   try {
@@ -467,7 +492,10 @@ async function loadStartConfig(): Promise<DaemonConfig> {
   const repoId = await resolveRepoId(preferred, cameras);
   const config: DaemonConfig = {
     repoId,
-    task: stored.task || "pick up the sponge",
+    task:
+      !storedTask || storedTask === "pick up the sponge" || storedTask === "pick up block"
+        ? "pick up the yellow sponge"
+        : storedTask,
     fps: stored.fps || 30,
     robotPort: armPorts.robotPort,
     teleopPort: armPorts.teleopPort,

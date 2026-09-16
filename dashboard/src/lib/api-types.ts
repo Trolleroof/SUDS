@@ -133,6 +133,15 @@ export type TeleopSync = {
   worst_joint: string | null;
 };
 
+export type RecorderDataQuality = {
+  ready: boolean;
+  issues: string[];
+  camera_config: Record<string, number>;
+  dataset_cameras: string[];
+  dataset_fps: number;
+  camera_streaming: Record<string, boolean>;
+};
+
 export type RecorderStatus = {
   state: RecorderState;
   repo_id: string;
@@ -145,6 +154,7 @@ export type RecorderStatus = {
   saved_episodes: number;
   message: string;
   cameras: string[];
+  data_quality?: RecorderDataQuality;
   hardware?: HardwarePayload;
   estop: EstopPayload;
   delta: DeltaPayload;

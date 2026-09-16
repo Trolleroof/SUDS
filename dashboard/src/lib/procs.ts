@@ -24,6 +24,12 @@ export type ProcConfig = {
   robotId: string;
   teleopId: string;
   cameras: { name: string; index: number }[];
+  gripperVision?: {
+    leftId: number;
+    rightId: number;
+    closedMaxPx?: number;
+    openMinPx?: number;
+  };
 };
 
 type Proc = {
@@ -54,7 +60,7 @@ export const CAMERA_PORT = 8614;
 
 export function isRunning(name: ProcName): boolean {
   const proc = slot(name);
-  return proc.child !== null && proc.child.exitCode === null && !proc.child.killed;
+  return proc.child !== null && proc.exit === null && proc.child.exitCode === null && !proc.child.killed;
 }
 
 export function status(name: ProcName) {
@@ -102,6 +108,21 @@ function command(name: ProcName, config: ProcConfig): { bin: string; args: strin
       return `camera ${camera.name} needs an index 0-64`;
     }
   }
+  const vision = config.gripperVision;
+  if (
+    vision &&
+    (!Number.isInteger(vision.leftId) ||
+      !Number.isInteger(vision.rightId) ||
+      vision.leftId === vision.rightId ||
+      ((vision.closedMaxPx == null) !== (vision.openMinPx == null)) ||
+      (vision.closedMaxPx != null &&
+        vision.openMinPx != null &&
+        (!Number.isFinite(vision.closedMaxPx) ||
+          !Number.isFinite(vision.openMinPx) ||
+          vision.closedMaxPx >= vision.openMinPx)))
+  ) {
+    return "gripper vision calibration is invalid";
+  }
   return {
     bin: binary("python"),
     args: [
@@ -109,6 +130,23 @@ function command(name: ProcName, config: ProcConfig): { bin: string; args: strin
       "--port",
       String(CAMERA_PORT),
       ...config.cameras.flatMap((c) => ["--camera", `${c.name}=${c.index}`]),
+      ...(config.gripperVision
+        ? [
+            "--gripper-vision",
+            "--gripper-left-id",
+            String(config.gripperVision.leftId),
+            "--gripper-right-id",
+            String(config.gripperVision.rightId),
+            ...(config.gripperVision.closedMaxPx != null && config.gripperVision.openMinPx != null
+              ? [
+                  "--gripper-closed-max-px",
+                  String(config.gripperVision.closedMaxPx),
+                  "--gripper-open-min-px",
+                  String(config.gripperVision.openMinPx),
+                ]
+              : []),
+          ]
+        : []),
     ],
   };
 }

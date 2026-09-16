@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { DatasetPayload, EpisodeRow, Verdict } from "@/lib/api-types";
+import type { DatasetPayload, EpisodeRow, Label, Verdict } from "@/lib/api-types";
 import { useRecorder } from "@/lib/use-recorder";
 
 import CalibrationPanel from "./CalibrationPanel";
@@ -15,6 +15,7 @@ import LabelBar from "./LabelBar";
 import LiveCameras from "./LiveCameras";
 import RecordBar from "./RecordBar";
 import SafetyBar from "./SafetyBar";
+import SlamPanel from "./SlamPanel";
 import StatsStrip from "./StatsStrip";
 import TracePanel from "./TracePanel";
 import VideoPanel from "./VideoPanel";
@@ -107,10 +108,10 @@ export default function Dashboard({
     [visible, selected],
   );
 
-  const labelEpisode = useCallback(
+  const saveLabel = useCallback(
     async (episode: EpisodeRow, verdict: Verdict, patch: { notes?: string | null } = {}) => {
       const previous = episode.label;
-      await fetch("/api/label", {
+      const res = await fetch("/api/label", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -121,17 +122,43 @@ export default function Dashboard({
           notes: patch.notes !== undefined ? patch.notes : previous?.notes ?? null,
         }),
       });
-      await refresh();
+      if (!res.ok) throw new Error((await res.json()).error ?? "failed to save label");
     },
-    [repoId, refresh],
+    [repoId],
+  );
+
+  // Labelling is an append-only write. Update this screen immediately instead
+  // of blocking the next video on the expensive full-dataset refresh.
+  const labelEpisode = useCallback(
+    (episode: EpisodeRow, verdict: Verdict, patch: { notes?: string | null } = {}) => {
+      const label: Label = {
+        episode_index: episode.episode_index,
+        verdict,
+        notes: patch.notes !== undefined ? patch.notes : episode.label?.notes ?? null,
+        labeled_at: new Date().toISOString(),
+      };
+      setData((previous) =>
+        previous
+          ? { ...previous, episodes: previous.episodes.map((row) => (row.episode_index === label.episode_index ? { ...row, label } : row)) }
+          : previous,
+      );
+      void saveLabel(episode, verdict, patch).catch((error: unknown) => {
+        setError((error as Error).message);
+        void refresh();
+      });
+    },
+    [refresh, saveLabel],
   );
 
   const label = useCallback(
     async (verdict: Verdict, patch: { notes?: string | null } = {}) => {
       if (!current) return;
-      await labelEpisode(current, verdict, patch);
+      const at = visible.findIndex((episode) => episode.episode_index === current.episode_index);
+      const next = visible[at + 1] ?? visible[at - 1];
+      labelEpisode(current, verdict, patch);
+      if (next) setSelected(next.episode_index);
     },
-    [current, labelEpisode],
+    [current, labelEpisode, visible],
   );
 
   // A discard is excluded from the "all" list and from anything the finetune
@@ -139,7 +166,7 @@ export default function Dashboard({
   const deleteEpisode = useCallback(
     (index: number) => {
       const episode = episodes.find((e) => e.episode_index === index);
-      if (episode) void labelEpisode(episode, "discard");
+      if (episode) labelEpisode(episode, "discard");
     },
     [episodes, labelEpisode],
   );
@@ -251,6 +278,7 @@ export default function Dashboard({
               {current && data && (
                 <>
                   <VideoPanel repoId={repoId} episode={current} videoKeys={data.video_keys} />
+                  <SlamPanel repoId={repoId} episodeIndex={current.episode_index} />
                   <LabelBar episode={current} onLabel={label} />
                   <TracePanel repoId={repoId} episode={current} data={data} />
                 </>

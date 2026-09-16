@@ -36,7 +36,15 @@ log = logging.getLogger("cameras")
 class Cameras:
     """Grabs from every camera on one thread and hands out the latest JPEG."""
 
-    def __init__(self, meta: dict[str, int], width: int, height: int, stream_fps: float, quality: int):
+    def __init__(
+        self,
+        meta: dict[str, int],
+        width: int,
+        height: int,
+        stream_fps: float,
+        quality: int,
+        gripper_vision: dict | None = None,
+    ):
         from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 
         self.meta = meta
@@ -56,6 +64,8 @@ class Cameras:
         self.misses: dict[str, int] = {}
         self.failed_at: dict[str, float] = {}
         self.retry_period = 5.0
+        self.gripper_vision = gripper_vision
+        self.gripper = {"state": "unknown", "gap_px": None} if gripper_vision else None
         self.cv = threading.Condition()
         self.seq = 0
 
@@ -103,6 +113,23 @@ class Cameras:
                 continue
             self.misses[name] = 0
             if isinstance(frame, np.ndarray) and frame.ndim == 3:
+                if name == "wrist" and self.gripper_vision:
+                    from gripper_vision import classify_gap, marker_gap
+
+                    gap = marker_gap(frame, self.gripper_vision["left_id"], self.gripper_vision["right_id"])
+                    calibrated = self.gripper_vision["closed_max_px"] is not None
+                    self.gripper = {
+                        "state": (
+                            classify_gap(
+                                gap,
+                                self.gripper_vision["closed_max_px"],
+                                self.gripper_vision["open_min_px"],
+                            )
+                            if calibrated
+                            else "unknown"
+                        ),
+                        "gap_px": None if gap is None else round(gap, 2),
+                    }
                 jpeg = encode_jpeg(frame, self.quality)
                 if jpeg:
                     encoded[name] = jpeg
@@ -151,7 +178,10 @@ class Cameras:
                     "error": self.errors.get(name),
                 }
                 for name, index in self.meta.items()
-            ]
+            ],
+            "gripper_vision": self.gripper_vision is not None,
+            "gripper_calibrated": bool(self.gripper_vision and self.gripper_vision["closed_max_px"] is not None),
+            "gripper": self.gripper,
         }
 
 
@@ -246,10 +276,32 @@ def main() -> int:
         help="Rate frames are published to the browser. The cameras themselves run at their own rate.",
     )
     parser.add_argument("--quality", type=int, default=70)
+    parser.add_argument("--gripper-vision", action="store_true")
+    parser.add_argument("--gripper-left-id", type=int, default=1)
+    parser.add_argument("--gripper-right-id", type=int, default=2)
+    parser.add_argument("--gripper-closed-max-px", type=float)
+    parser.add_argument("--gripper-open-min-px", type=float)
     args = parser.parse_args()
 
+    if (args.gripper_closed_max_px is None) != (args.gripper_open_min_px is None):
+        parser.error("both gripper thresholds are required together")
+    if (
+        args.gripper_closed_max_px is not None
+        and args.gripper_open_min_px is not None
+        and args.gripper_closed_max_px >= args.gripper_open_min_px
+    ):
+        parser.error("--gripper-closed-max-px must be less than --gripper-open-min-px")
+
     meta = {spec.split("=", 1)[0]: int(spec.split("=", 1)[1]) for spec in args.camera}
-    cameras = Cameras(meta, args.width, args.height, args.stream_fps, args.quality)
+    gripper_vision = None
+    if args.gripper_vision:
+        gripper_vision = {
+            "left_id": args.gripper_left_id,
+            "right_id": args.gripper_right_id,
+            "closed_max_px": args.gripper_closed_max_px,
+            "open_min_px": args.gripper_open_min_px,
+        }
+    cameras = Cameras(meta, args.width, args.height, args.stream_fps, args.quality, gripper_vision)
     cameras.connect()
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(cameras))

@@ -135,6 +135,7 @@ export default function DaemonPanel({
       },
       configured,
     );
+    const storedTask = String(stored.task ?? "").trim();
     const datasetCams = (datasetCameras.length ? datasetCameras : cameraDefaults.map((c) => c.name)).map((name, i) => ({
       name,
       index: cameraDefaults.find((camera) => camera.name === name)?.index ?? i,
@@ -143,7 +144,10 @@ export default function DaemonPanel({
     setConfig(
       status.config ?? {
         repoId: (stored.repoId as string) || repoId || "suds/live",
-        task: (stored.task as string) || "pick up the sponge",
+        task:
+          !storedTask || storedTask === "pick up the sponge" || storedTask === "pick up block"
+            ? "pick up the yellow sponge"
+            : storedTask,
         fps: (stored.fps as number) || 30,
         robotPort: ports.robotPort ?? DEFAULT_ARM_PORTS.robotPort,
         teleopPort: ports.teleopPort ?? DEFAULT_ARM_PORTS.teleopPort,
@@ -156,7 +160,7 @@ export default function DaemonPanel({
     );
   }, [config, status, repoId, datasetCameras, armsReady, camerasReady, configured, cameraDefaults]);
 
-  // Cameras are locked to config/cameras.json (overhead, then wrist).
+  // Cameras are locked to config/cameras.json.
   useEffect(() => {
     if (!config || !camerasReady || !cameraDefaults.length) return;
     const same =
@@ -381,7 +385,7 @@ export default function DaemonPanel({
                   </div>
                 </div>
               ))}
-              <p className="hint">Locked — wrist on top (index 0), overhead below (index 1)</p>
+              <p className="hint">Locked — wrist on top (index 1), overhead below (index 0)</p>
             </div>
           </div>
 

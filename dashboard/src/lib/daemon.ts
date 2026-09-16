@@ -35,6 +35,7 @@ type Daemon = {
   config: DaemonConfig | null;
   startedAt: number;
   log: string[];
+  logPath?: string | null;
   exit: { code: number | null; signal: string | null; at: number } | null;
 };
 
@@ -44,6 +45,7 @@ const daemon: Daemon = (store.__sudsDaemon ??= {
   config: null,
   startedAt: 0,
   log: [],
+  logPath: null,
   exit: null,
 });
 
@@ -129,6 +131,7 @@ export function status() {
     uptime_s: isRunning() ? (Date.now() - daemon.startedAt) / 1000 : 0,
     config: daemon.config,
     log: daemon.log.slice(-60),
+    log_path: daemon.logPath ?? null,
     exit: daemon.exit,
   };
 }
@@ -150,16 +153,27 @@ export function start(config: DaemonConfig): { ok: boolean; error?: string } {
     cwd: repoRoot(),
     // Unbuffered, or the log panel stays empty until the process dies.
     env: { ...process.env, PYTHONUNBUFFERED: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
+    // LeRobot asks once whether to use an existing calibration file. The
+    // dashboard has no interactive stdin, so accept that file explicitly;
+    // a missing calibration still fails closed in record_server.py.
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stdin?.write("\n");
+  child.stdin?.end();
 
   daemon.child = child;
   daemon.config = config;
   daemon.startedAt = Date.now();
   daemon.exit = null;
   daemon.log = [`$ ${python()} ${args.join(" ")}`];
+  const logDir = path.join(repoRoot(), "logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `recorder-${new Date().toISOString().replaceAll(":", "-")}.log`);
+  daemon.logPath = logPath;
+  fs.writeFileSync(logPath, `${daemon.log[0]}\n`);
 
   const append = (chunk: Buffer) => {
+    fs.appendFile(logPath, chunk, () => {});
     for (const line of chunk.toString().split("\n")) {
       if (line.trim()) daemon.log.push(line);
     }
@@ -170,9 +184,15 @@ export function start(config: DaemonConfig): { ok: boolean; error?: string } {
 
   child.on("exit", (code, signal) => {
     daemon.exit = { code, signal, at: Date.now() };
-    daemon.log.push(`— exited with code ${code ?? "null"}${signal ? ` (${signal})` : ""}`);
+    const line = `— exited with code ${code ?? "null"}${signal ? ` (${signal})` : ""}`;
+    daemon.log.push(line);
+    fs.appendFile(logPath, `${line}\n`, () => {});
   });
-  child.on("error", (err) => daemon.log.push(`— could not start: ${err.message}`));
+  child.on("error", (err) => {
+    const line = `— could not start: ${err.message}`;
+    daemon.log.push(line);
+    fs.appendFile(logPath, `${line}\n`, () => {});
+  });
 
   return { ok: true };
 }

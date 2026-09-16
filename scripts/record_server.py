@@ -36,7 +36,7 @@ give up on the lock and write anyway.
 
     python scripts/record_server.py --repo-id suds/pick_sponge \
         --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-        --camera third_person=0 --camera wrist=1
+        --camera wrist=0 --camera overhead=1
 """
 
 from __future__ import annotations
@@ -83,6 +83,8 @@ WS_PERIOD = 0.1
 DEFAULT_REST_SECONDS = 2.0
 DEFAULT_START_SECONDS = 0.8
 DEFAULT_SYNC_SECONDS = 0.8
+TRAINING_TASK = "pick up the yellow sponge"
+TRAINING_CAMERAS = {"wrist": 0, "overhead": 1}
 # SO-101 follower rest pose, in the project's normalized joint units. Captured
 # directly off the physical arm posed by hand -- not a guess -- so change this
 # by posing the arm again and re-reading it, not by editing numbers by feel.
@@ -92,7 +94,9 @@ REST_POSE = {
     "elbow_flex": 95.9,
     "wrist_flex": 50.9,
     "wrist_roll": 1.4,
-    "gripper": 0.8,
+    # Keep the gripper away from its calibrated hard stop during discard/stop.
+    # ponytail: mid-range neutral; tune against the physical jaw clearance.
+    "gripper": 40.0,
 }
 # Pose the follower eases into the instant engage is pressed, before handing
 # off to the leader -- same deal as REST_POSE: captured off the physical arm,
@@ -157,6 +161,29 @@ def safe_build_dataset_frame(
                 img = np.clip(img, 0, 255).astype(np.uint8)
             frame[key] = np.ascontiguousarray(img)
     return frame
+
+
+def recorder_data_issues(
+    task: str,
+    fps: int,
+    dataset_fps: int,
+    camera_meta: dict[str, int],
+    dataset_cameras: set[str],
+    camera_streaming: dict[str, bool],
+) -> list[str]:
+    issues = []
+    if task.strip() != TRAINING_TASK:
+        issues.append(f'task must be "{TRAINING_TASK}"')
+    if camera_meta != TRAINING_CAMERAS:
+        issues.append("camera labels must be wrist=0 and overhead=1")
+    if set(camera_meta) != dataset_cameras:
+        issues.append("recorder camera names do not match the dataset")
+    if fps != dataset_fps:
+        issues.append(f"recorder is {fps} fps but dataset is {dataset_fps} fps")
+    missing = [name for name, streaming in camera_streaming.items() if not streaming]
+    if missing:
+        issues.append(f"no fresh frames from {', '.join(sorted(missing))}")
+    return issues
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -376,6 +403,7 @@ class Recorder:
         self._teleop_temps: dict[str, int] = {}
         self._follower_temps: dict[str, int] = {}
         self._hardware: dict[str, Any] = {}
+        self._quality: dict[str, Any] = {}
 
     # -- called from the HTTP thread ------------------------------------
 
@@ -408,10 +436,11 @@ class Recorder:
             if name == "task":
                 self.task = payload.get("task") or self.task
             elif name == "record":
-                if self.state in (IDLE, PENDING) or not self.engaged:
-                    self._command = "record"
-                else:
+                if self.state not in (IDLE, PENDING):
                     return {"ok": False, "error": f"cannot record while {self.state}"}
+                if not self.engaged or not self._control_ready:
+                    return {"ok": False, "error": "follower control is not settled yet"}
+                self._command = "record"
             elif name == "stop" and self.state == RECORDING:
                 self._command = "stop"
             elif name == "discard" and self.state in (RECORDING, PENDING):
@@ -531,7 +560,7 @@ class Recorder:
 
         with self.lock:
             self.engaged = engaged
-            self._control_ready = True
+            self._control_ready = False
             self.last_message = (
                 "teleop engaged — the follower is tracking the leader"
                 if engaged
@@ -619,6 +648,18 @@ class Recorder:
     def status(self) -> dict[str, Any]:
         with self.lock:
             now = time.time()
+            dataset_cameras = {
+                key.removeprefix(f"{OBS_STR}.images.")
+                for key, feature in self.dataset.features.items()
+                if key.startswith(f"{OBS_STR}.images.") and feature.get("dtype") in ("image", "video")
+            }
+            camera_streaming = {
+                name: name in self._last_camera_frames and self._camera_misses.get(name, 0) == 0
+                for name in self.camera_meta
+            }
+            issues = recorder_data_issues(
+                self.task, self.fps, self.dataset.fps, self.camera_meta, dataset_cameras, camera_streaming
+            )
             return {
                 "state": self.state,
                 "repo_id": self.dataset.repo_id,
@@ -632,6 +673,14 @@ class Recorder:
                 "message": self.last_message,
                 "hardware": dict(self._hardware),
                 "cameras": list(self.camera_meta),
+                "data_quality": {
+                    "ready": not issues,
+                    "issues": issues,
+                    "camera_config": dict(self.camera_meta),
+                    "dataset_cameras": sorted(dataset_cameras),
+                    "dataset_fps": self.dataset.fps,
+                    "camera_streaming": camera_streaming,
+                },
                 "estop": {
                     "engaged": self.estop,
                     "reason": self.estop_reason,
@@ -644,8 +693,8 @@ class Recorder:
                     # Same number the delta panel already shows, restated as the
                     # yes/no the Engage button needs. A delta with no joints in
                     # it is not "aligned", it is "not measured yet".
-                    "ready": True,
-                    "record_ready": True,
+                    "ready": bool(self._delta.get("joints")) and self._delta.get("max", 0.0) <= self.delta_limit,
+                    "record_ready": self.engaged and self._control_ready,
                     "worst": self._delta.get("max", 0.0),
                     "worst_joint": self._delta.get("max_joint"),
                 },
@@ -688,6 +737,9 @@ class Recorder:
         is_alive = bool(getattr(cam, "is_connected", False) and getattr(cam, "thread", None) and cam.thread.is_alive())
         if not is_alive or frame is None:
             self._camera_misses[name] = self._camera_misses.get(name, 0) + 1
+            if self.state == RECORDING:
+                self._quality.setdefault("camera_misses", {}).setdefault(name, 0)
+                self._quality["camera_misses"][name] += 1
             if self._camera_misses[name] >= 5 and (now - self._camera_failed_at.get(name, 0.0) >= 3.0):
                 self._camera_failed_at[name] = now
                 log.warning("camera %s connection/thread lost, reconnecting in background...", name)
@@ -733,6 +785,8 @@ class Recorder:
                     self._last_robot_pos_at = now
         except Exception as err:
             log.debug("read robot position exception: %s", err)
+            if self.state == RECORDING:
+                self._quality["bus_errors"] = self._quality.get("bus_errors", 0) + 1
 
         for m in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
             key = f"{m}.pos"
@@ -766,6 +820,8 @@ class Recorder:
                     self._last_teleop_action_at = now
         except Exception as err:
             log.debug("read teleop action exception: %s", err)
+            if self.state == RECORDING:
+                self._quality["bus_errors"] = self._quality.get("bus_errors", 0) + 1
 
         for m in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
             key = f"{m}.pos"
@@ -807,6 +863,7 @@ class Recorder:
             except Exception as err:  # noqa: BLE001
                 log.error("could not record frame to dataset: %s", err)
                 with self.lock:
+                    self._quality["frame_errors"] = self._quality.get("frame_errors", 0) + 1
                     self.last_message = f"frame error: {err}"
 
         with self.lock:
@@ -837,6 +894,8 @@ class Recorder:
                 sent = self.robot.send_action(action) if (self.engaged and action) else None
         except Exception as err:  # noqa: BLE001
             log.warning("teleop read/write failed, skipping this tick: %s", err)
+            if self.state == RECORDING:
+                self._quality["skipped_ticks"] = self._quality.get("skipped_ticks", 0) + 1
             return None, None
         self._update_delta(action, observation)
         with self.lock:
@@ -954,6 +1013,7 @@ class Recorder:
         with self.lock:
             self.state = RECORDING
             self.frames = 0
+            self._quality = {"bus_errors": 0, "frame_errors": 0, "skipped_ticks": 0, "camera_misses": {}, "max_tracking_delta": 0.0}
             self.started_at = time.time()
             self.last_message = "recording"
         log.info("recording started")
@@ -1003,10 +1063,27 @@ class Recorder:
             return
         self._since_flush = 0
         with self.lock:
+            episode = self.dataset.meta.total_episodes - 1
+            quality = {
+                "episode": episode,
+                "task": self.task,
+                "fps": self.fps,
+                "frames": frames,
+                "duration_s": round(frames / self.fps, 3),
+                "camera_config": dict(self.camera_meta),
+                **self._quality,
+            }
+            quality["quality_ok"] = (
+                quality["bus_errors"] == 0
+                and quality["frame_errors"] == 0
+                and quality["skipped_ticks"] == 0
+                and not any(quality["camera_misses"].values())
+                and quality["max_tracking_delta"] <= self.delta_limit
+            )
             self.state = IDLE
             self.frames = 0
-            self.last_message = f"saved episode {self.dataset.meta.total_episodes - 1} ({frames} frames)"
-        log.info("saved episode %d (%d frames)", self.dataset.meta.total_episodes - 1, frames)
+            self.last_message = f"saved episode {episode} ({frames} frames)"
+        log.info("TRAINING_EPISODE %s", json.dumps(quality, sort_keys=True))
 
     # -- calibration ----------------------------------------------------
 
@@ -1113,6 +1190,8 @@ class Recorder:
         over = worst > self.delta_limit
         self._over_ticks = self._over_ticks + 1 if over else 0
         with self.lock:
+            if self.state == RECORDING:
+                self._quality["max_tracking_delta"] = max(self._quality.get("max_tracking_delta", 0.0), round(worst, 2))
             self._delta = {
                 "joints": joints,
                 "max": round(worst, 2),
@@ -1535,7 +1614,7 @@ def build_hardware(args):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-id", required=True)
-    parser.add_argument("--task", default="pick up the sponge")
+    parser.add_argument("--task", default=TRAINING_TASK)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--commit-seconds",
@@ -1562,7 +1641,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=INDEX",
-        help="Repeatable, e.g. --camera third_person=0 --camera wrist=1",
+        help="Repeatable, e.g. --camera wrist=0 --camera overhead=1",
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)

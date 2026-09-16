@@ -96,7 +96,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path.home() / ".cache/huggingface/lerobot/suds/live_2",
+        default=Path.home() / ".cache/huggingface/lerobot/suds/live_2_corrected",
     )
     parser.add_argument("--subsets", type=Path, default=REPO / "datasets/suds__live_2.subsets.json")
     parser.add_argument("--tolerance", type=float, default=15.0,
