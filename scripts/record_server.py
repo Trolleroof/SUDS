@@ -1641,7 +1641,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=INDEX",
-        help="Repeatable, e.g. --camera wrist=0 --camera overhead=1",
+        help="Repeatable; the trained schema is --camera wrist=0 --camera overhead=1",
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)

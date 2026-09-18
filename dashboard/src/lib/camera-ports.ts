@@ -5,7 +5,7 @@ export const DEFAULT_CAMERAS: CameraSpec[] = [
   { name: "overhead", index: 1 },
 ];
 
-/** Wrist always first (top), overhead always second (bottom). Names stay on the right USB index. */
+/** Physical mapping for this rig: OpenCV 0 is wrist; OpenCV 1 is overhead. */
 const DISPLAY_ORDER = ["wrist", "overhead"];
 
 export function sortCamerasForDisplay<T>(items: T[], nameOf: (item: T) => string): T[] {

@@ -385,7 +385,7 @@ export default function DaemonPanel({
                   </div>
                 </div>
               ))}
-              <p className="hint">Locked — wrist on top (index 1), overhead below (index 0)</p>
+              <p className="hint">Locked — wrist on top (index 0), overhead below (index 1)</p>
             </div>
           </div>
 

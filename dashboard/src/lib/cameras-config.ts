@@ -22,6 +22,10 @@ export function readCamerasConfigFile(): CamerasConfigFile | null {
       ([name, index]) => /^[a-z][a-z0-9_]*$/i.test(name) && Number.isInteger(index) && index >= 0,
     );
     if (!entries.length) return null;
+    // The file is the source of truth: it is what the recorder is launched
+    // with, and `record_server.py` refuses to start unless the labels match its
+    // TRAINING_CAMERAS contract (wrist=0, overhead=1). Silently rewriting the
+    // indices here hid a bad config instead of surfacing it.
     return Object.fromEntries(entries);
   } catch {
     return null;
