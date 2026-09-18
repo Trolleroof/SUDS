@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 
 ROBOT_PORT = "/dev/tty.usbmodem5C821094831"
-WRIST_CAM = 0
+WRIST_CAM = 1  # OpenCV index of the close gripper view; see config/cameras.json
+OVERHEAD_CAM = 0  # wide workspace view
 OUT = Path("/Users/nikhi/SUDS/outputs/green_pick_v2")
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -309,7 +310,7 @@ def main():
         save(annotate(frame, blob, "lifted"), "92_lifted.jpg")
 
         # overhead evidence
-        cap = cv2.VideoCapture(1)
+        cap = cv2.VideoCapture(OVERHEAD_CAM)
         oh = None
         if cap.isOpened():
             for _ in range(10):

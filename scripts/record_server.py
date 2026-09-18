@@ -36,7 +36,7 @@ give up on the lock and write anyway.
 
     python scripts/record_server.py --repo-id suds/pick_sponge \
         --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-        --camera wrist=0 --camera overhead=1
+        --camera wrist=1 --camera overhead=0
 """
 
 from __future__ import annotations
@@ -84,7 +84,40 @@ DEFAULT_REST_SECONDS = 2.0
 DEFAULT_START_SECONDS = 0.8
 DEFAULT_SYNC_SECONDS = 0.8
 TRAINING_TASK = "pick up the yellow sponge"
-TRAINING_CAMERAS = {"wrist": 0, "overhead": 1}
+CAMERAS_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "cameras.json"
+
+
+def load_training_cameras(path: Path = CAMERAS_CONFIG_PATH) -> dict[str, int]:
+    """Read the camera contract -- label -> OpenCV index -- from `config/cameras.json`.
+
+    That file is the single source of truth: the dashboard launches this daemon
+    straight from it, so a second copy of the mapping here is exactly how the
+    labels get crossed. The labels are semantic and must not be renamed to suit
+    the wiring -- `wrist` is the close gripper view and `overhead` the wide
+    workspace view, which is what `observation.images.*` means in the dataset.
+    Move the *indices* when OpenCV enumerates the rig differently.
+
+    A missing or malformed file is fatal rather than defaulted: recording
+    against the wrong index fills `observation.images.wrist` with the overhead
+    view, and nothing downstream can tell.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read the camera contract at {path}: {exc}") from exc
+    if not isinstance(raw, dict) or not raw:
+        raise SystemExit(f"{path} must be a non-empty object of camera label -> OpenCV index")
+    cameras: dict[str, int] = {}
+    for name, index in raw.items():
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise SystemExit(f"{path}: camera {name!r} needs a non-negative integer index, got {index!r}")
+        cameras[str(name)] = index
+    if len(set(cameras.values())) != len(cameras):
+        raise SystemExit(f"{path}: two cameras share an OpenCV index -- {cameras}")
+    return cameras
+
+
+TRAINING_CAMERAS = load_training_cameras()
 # SO-101 follower rest pose, in the project's normalized joint units. Captured
 # directly off the physical arm posed by hand -- not a guess -- so change this
 # by posing the arm again and re-reading it, not by editing numbers by feel.
@@ -175,7 +208,8 @@ def recorder_data_issues(
     if task.strip() != TRAINING_TASK:
         issues.append(f'task must be "{TRAINING_TASK}"')
     if camera_meta != TRAINING_CAMERAS:
-        issues.append("camera labels must be wrist=0 and overhead=1")
+        expected = " and ".join(f"{name}={index}" for name, index in sorted(TRAINING_CAMERAS.items()))
+        issues.append(f"camera labels must be {expected} (from {CAMERAS_CONFIG_PATH.name})")
     if set(camera_meta) != dataset_cameras:
         issues.append("recorder camera names do not match the dataset")
     if fps != dataset_fps:
@@ -1597,6 +1631,18 @@ COMMANDS = {
 def build_hardware(args):
     camera_meta = {spec.split("=", 1)[0]: int(spec.split("=", 1)[1]) for spec in args.camera}
 
+    # Refuse before anything is opened. A crossed index still streams, still
+    # fills both observation keys, and only shows up as a policy that reaches
+    # for nothing -- so this has to be an exit, not a warning.
+    if camera_meta != TRAINING_CAMERAS:
+        want = " ".join(f"--camera {name}={index}" for name, index in sorted(TRAINING_CAMERAS.items()))
+        got = " ".join(f"--camera {name}={index}" for name, index in sorted(camera_meta.items())) or "(none)"
+        raise SystemExit(
+            f"camera mapping does not match {CAMERAS_CONFIG_PATH}: expected {want}, got {got}. "
+            "The labels are semantic -- wrist is the close gripper view, overhead the wide workspace "
+            "view -- so fix the indices, not the names."
+        )
+
     from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
@@ -1641,7 +1687,8 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=INDEX",
-        help="Repeatable; the trained schema is --camera wrist=0 --camera overhead=1",
+        help="Repeatable; must match config/cameras.json, currently "
+        + " ".join(f"--camera {name}={index}" for name, index in sorted(TRAINING_CAMERAS.items())),
     )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)

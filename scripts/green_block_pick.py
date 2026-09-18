@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 ROBOT_PORT = "/dev/tty.usbmodem5C821094831"
-WRIST_CAM = 0
+WRIST_CAM = 1  # OpenCV index of the close gripper view; see config/cameras.json
 OUT = Path("/Users/nikhi/SUDS/outputs/green_pick")
 OUT.mkdir(parents=True, exist_ok=True)
 

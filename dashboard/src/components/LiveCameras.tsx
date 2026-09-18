@@ -73,7 +73,7 @@ export default function LiveCameras({ recorder }: { recorder: Recorder }) {
         <h2>live cameras</h2>
         <div className="inner hint">
           no cameras configured — start the recorder with{" "}
-          <code>--camera wrist=0 --camera overhead=1</code>
+          <code>--camera wrist=1 --camera overhead=0</code>
         </div>
       </section>
     );

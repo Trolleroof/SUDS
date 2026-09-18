@@ -57,9 +57,10 @@ type CalibrationSummary = Record<"leader" | "follower", { exists: boolean; suspe
  * Start and stop the recorder daemon from the dashboard.
  *
  * Everything the daemon takes on its command line is a control here: which
- * dataset, which serial port is which arm, which camera index is the
- * third-person view and which is the wrist. Ports and camera indices are
- * discovered rather than typed, because on macOS `/dev/tty.usbmodem*` names
+ * dataset, which serial port is which arm, which OpenCV index is the overhead
+ * view and which is the wrist. Ports come from discovery and the camera indices
+ * from `config/cameras.json` rather than being typed, because on macOS
+ * `/dev/tty.usbmodem*` names
  * change between reboots and a wrong index is the single most common way to
  * lose an afternoon.
  *
@@ -385,7 +386,12 @@ export default function DaemonPanel({
                   </div>
                 </div>
               ))}
-              <p className="hint">Locked — wrist on top (index 0), overhead below (index 1)</p>
+              <p className="hint">
+                Locked to config/cameras.json —{" "}
+                {sortCamerasForDisplay(config.cameras, (camera) => camera.name)
+                  .map((camera) => `${camera.name} on index ${camera.index}`)
+                  .join(", ")}
+              </p>
             </div>
           </div>
 

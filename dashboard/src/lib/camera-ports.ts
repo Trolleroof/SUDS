@@ -1,11 +1,16 @@
 export type CameraSpec = { name: string; index: number };
 
+/**
+ * Only used when `config/cameras.json` cannot be read — it is the source of
+ * truth and this must mirror it. Physical mapping for this rig: OpenCV 1 is the
+ * wrist (close gripper view), OpenCV 0 is the overhead (wide workspace view).
+ */
 export const DEFAULT_CAMERAS: CameraSpec[] = [
-  { name: "wrist", index: 0 },
-  { name: "overhead", index: 1 },
+  { name: "wrist", index: 1 },
+  { name: "overhead", index: 0 },
 ];
 
-/** Physical mapping for this rig: OpenCV 0 is wrist; OpenCV 1 is overhead. */
+/** Display order is semantic — wrist first — and independent of OpenCV index. */
 const DISPLAY_ORDER = ["wrist", "overhead"];
 
 export function sortCamerasForDisplay<T>(items: T[], nameOf: (item: T) => string): T[] {

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { DEFAULT_CAMERAS } from "@/lib/camera-ports";
 import { useCamerasConfig } from "@/lib/use-cameras-config";
 
 type CameraState = { name: string; index: number; streaming: boolean; error: string | null };
@@ -18,6 +19,8 @@ type CamerasStatus = {
 };
 
 const WRIST = "wrist";
+/** Fallback only — config/cameras.json is the source of truth for the index. */
+const WRIST_FALLBACK_INDEX = DEFAULT_CAMERAS.find((camera) => camera.name === WRIST)?.index ?? 0;
 
 /**
  * Handheld collection preview: the wrist camera only.
@@ -28,7 +31,7 @@ const WRIST = "wrist";
  */
 export default function CollectPanel() {
   const { configured, ready } = useCamerasConfig();
-  const wristIndex = configured.find((camera) => camera.name === WRIST)?.index ?? 0;
+  const wristIndex = configured.find((camera) => camera.name === WRIST)?.index ?? WRIST_FALLBACK_INDEX;
 
   const [status, setStatus] = useState<CamerasStatus | null>(null);
   const [error, setError] = useState<string | null>(null);

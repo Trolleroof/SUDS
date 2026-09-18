@@ -35,7 +35,7 @@ a frame). It does not measure teleop quality — just "is there power?"
 ```bash
 python scripts/health_server.py \
     --teleop-port /dev/tty.usbmodemXXXX --robot-port /dev/tty.usbmodemYYYY \
-    --camera wrist=0 --camera overhead=1
+    --camera wrist=1 --camera overhead=0
 ```
 
 The daemon rescans every couple of seconds on `http://127.0.0.1:8612`
@@ -205,7 +205,7 @@ the arm, the cameras, and the dataset writer, and exposes start/stop over HTTP:
 # real hardware
 python ../scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-    --camera wrist=0 --camera overhead=1 --task "pick up the sponge"
+    --camera wrist=1 --camera overhead=0 --task "pick up the sponge"
 ```
 
 The dashboard finds it at `http://127.0.0.1:8611` (`SUDS_RECORDER_URL` to

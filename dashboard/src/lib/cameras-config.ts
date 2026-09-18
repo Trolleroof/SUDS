@@ -24,7 +24,10 @@ export function readCamerasConfigFile(): CamerasConfigFile | null {
     if (!entries.length) return null;
     // The file is the source of truth: it is what the recorder is launched
     // with, and `record_server.py` refuses to start unless the labels match its
-    // TRAINING_CAMERAS contract (wrist=0, overhead=1). Silently rewriting the
+    // TRAINING_CAMERAS contract, which it now reads from this same file.
+    // The labels are semantic (`wrist` = close gripper view, `overhead` = wide
+    // workspace view) and match `observation.images.*`; only the OpenCV indices
+    // move when the rig is re-enumerated. Silently rewriting the
     // indices here hid a bad config instead of surfacing it.
     return Object.fromEntries(entries);
   } catch {

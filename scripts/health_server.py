@@ -7,7 +7,7 @@ frame), and disconnects.
 
     python scripts/health_server.py \
         --teleop-port /dev/tty.usbmodemXXXX --robot-port /dev/tty.usbmodemYYYY \
-    --camera wrist=0 --camera overhead=1
+    --camera wrist=1 --camera overhead=0
 
 Dashboard: http://127.0.0.1:8612/status  (SUDS_HEALTH_URL to override)
 """

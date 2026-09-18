@@ -184,7 +184,7 @@ normal path:
 ```bash
 python scripts/record_server.py --repo-id suds/pick_sponge \
     --robot-port /dev/tty.usbmodemXXXX --teleop-port /dev/tty.usbmodemYYYY \
-    --camera wrist=0 --camera overhead=1
+    --camera wrist=1 --camera overhead=0
 ```
 
 Space starts and stops a take, backspace throws it away, enter commits it early —
