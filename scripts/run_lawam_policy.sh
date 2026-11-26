@@ -88,6 +88,7 @@ exec </dev/null
   --policy_device=cuda \
   --actions_per_chunk=24 \
   --chunk_size_threshold=0.875 \
+  --handoff_steps="${SUDS_LAWAM_HANDOFF_STEPS:-6}" \
   --action_stall_timeout_s=2 \
   --aggregate_fn_name=weighted_average \
   --debug_visualize_queue_size=false

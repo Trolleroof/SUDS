@@ -6,6 +6,7 @@ import base64
 import json
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 
@@ -19,6 +20,18 @@ from lerobot.async_inference.robot_client import RobotClient, RobotClientConfig
 from lerobot.async_inference.helpers import TimedAction
 from lerobot.cameras.zmq.camera_zmq import ZMQCamera
 from lerobot.utils.import_utils import register_third_party_plugins
+
+from lawam_handoff import handoff_weights
+
+
+@dataclass
+class LawamClientConfig(RobotClientConfig):
+    handoff_steps: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.handoff_steps != 0 and not 2 <= self.handoff_steps <= self.actions_per_chunk:
+            raise ValueError("handoff_steps must be zero or between two and actions_per_chunk")
 
 
 def strict_camera_read(camera):
@@ -44,6 +57,10 @@ class LawamRobotClient(RobotClient):
         # Base control_loop_action also acquires this lock. Keep pop, send and
         # latest_action publication atomic relative to incoming queue merges.
         self.action_queue_lock = threading.RLock()
+        self._handoff_steps = config.handoff_steps
+        self._gripper_index = (
+            tuple(self.robot.action_features).index("gripper.pos") if self._handoff_steps else None
+        )
         self._starved_at = None
         self._audit_count = 0
         self._audit_dir = Path("logs") / f"lawam_inputs_{time.time_ns()}"
@@ -57,22 +74,40 @@ class LawamRobotClient(RobotClient):
             pending = {a.get_timestep(): a for a in self.action_queue.queue
                        if a.get_timestep() > self.latest_action}
             before = len(pending)
-            stale = 0
-            for action in incoming_actions:
-                step = action.get_timestep()
-                if step <= self.latest_action:
-                    stale += 1
-                    continue
+            fresh = [a for a in incoming_actions if a.get_timestep() > self.latest_action]
+            incoming = {a.get_timestep(): a for a in fresh}
+            if len(incoming) != len(fresh):
+                raise ValueError("LaWAM returned duplicate action timesteps")
+            stale = len(incoming_actions) - len(fresh)
+            steps = sorted(incoming)
+            weights = {}
+            if self._handoff_steps and steps:
+                if pending and steps[-1] <= max(pending) and all(step in pending for step in steps):
+                    # A fully covered response would splice back into the old tail.
+                    self.logger.debug("Ignoring chunk already covered through step %d", steps[-1])
+                    return
+                weights = handoff_weights(pending, steps, self._handoff_steps)
+            for step in steps:
+                action = incoming[step]
                 if step in pending:
-                    action = TimedAction(action.get_timestamp(), step,
-                                         aggregate_fn(pending[step].get_action(), action.get_action()))
+                    old = pending[step].get_action()
+                    new = action.get_action()
+                    if self._handoff_steps:
+                        weight = weights.get(step, 1.0)
+                        target = torch.lerp(old, new, weight)
+                        # Preserve a predicted gripper target through the handoff.
+                        grip_plan = old if weight < 0.5 else new
+                        target[self._gripper_index] = grip_plan[self._gripper_index]
+                    else:
+                        target = aggregate_fn(old, new)
+                    action = TimedAction(action.get_timestamp(), step, target)
                 pending[step] = action
             replacement = Queue()
             for step in sorted(pending):
                 replacement.put(pending[step])
             self.action_queue = replacement
-            self.logger.info("Action queue: before=%d incoming=%d stale=%d after=%d",
-                             before, len(incoming_actions), stale, len(pending))
+            self.logger.info("Action queue: before=%d incoming=%d stale=%d handoff=%d after=%d",
+                             before, len(incoming_actions), stale, len(weights), len(pending))
 
     def _queue_observation(self, observation):
         # The server's similarity filter compares joints only. A stationary arm
@@ -131,7 +166,7 @@ class LawamRobotClient(RobotClient):
 
 
 @draccus.wrap()
-def main(config: RobotClientConfig):
+def main(config: LawamClientConfig):
     if config.policy_type != "lawam":
         raise ValueError("This launcher requires policy_type=lawam")
     # Scope the strict camera decoder to this client process only.

@@ -34,11 +34,34 @@ def client():
     c.logger = logging.getLogger("test")
     c._audit_count = 0
     c._starved_at = None
+    c._handoff_steps = 0
+    c._gripper_index = 5
     c.robot = SimpleNamespace(action_features={f"joint{i}.pos": float for i in range(6)})
     return c
 
 
 class ClientTests(unittest.TestCase):
+    def test_handoff_aligns_after_latency_and_preserves_gripper_targets(self):
+        c = client()
+        c._handoff_steps = 6
+        c._aggregate_action_queues([action(i, 0) for i in range(1, 25)])
+        c.latest_action = 18
+        c._aggregate_action_queues([action(i, 10) for i in range(10, 34)])
+        queued = list(c.action_queue.queue)
+        self.assertEqual([a.timestep for a in queued], list(range(19, 34)))
+        self.assertEqual([a.action[5].item() for a in queued], [0] * 3 + [10] * 12)
+        joints = [0] + [a.action[0].item() for a in queued]
+        self.assertEqual(joints[:2], [0, 0])
+        self.assertEqual(joints[6:], [10] * 10)
+        self.assertLess(max(b - a for a, b in zip(joints, joints[1:])), 3)
+
+    def test_handoff_ignores_covered_chunk_and_keeps_pending_tail(self):
+        c = client()
+        c._handoff_steps = 6
+        c._aggregate_action_queues([action(i) for i in range(1, 25)])
+        c._aggregate_action_queues([action(i, 8) for i in range(5, 15)])
+        self.assertEqual([a.action[0].item() for a in c.action_queue.queue], [1] * 24)
+
     def test_preserves_pending_tail_and_ignores_stale_chunk(self):
         c = client()
         c._aggregate_action_queues([action(i) for i in range(1, 25)])
