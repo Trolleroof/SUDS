@@ -92,7 +92,7 @@ def check_molmoact2_joint_frame(stats: dict, tolerance: float) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", choices=["groot", "molmoact2"], default="groot")
+    parser.add_argument("--policy", choices=["groot", "molmoact2", "pi05"], default="groot")
     parser.add_argument(
         "--root",
         type=Path,
@@ -128,6 +128,11 @@ def main() -> None:
     print("\ncameras")
     cams = sorted(k for k in info["features"] if k.startswith("observation.images."))
     check(len(cams) == 2, "exactly two camera streams", ", ".join(cams))
+    if args.policy == "pi05":
+        expected_cams = ["observation.images.overhead", "observation.images.wrist"]
+        check(cams == expected_cams, "camera names match the π₀.₅ deployment")
+        for cam in cams:
+            check(info["features"][cam]["shape"] == [480, 640, 3], f"{cam} is 640×480 RGB")
     for cam in cams:
         codec = info["features"][cam]["info"].get("video.codec")
         if codec == "av1":
@@ -141,7 +146,7 @@ def main() -> None:
 
     if args.policy == "molmoact2":
         check_molmoact2_joint_frame(stats, args.tolerance)
-    else:
+    elif args.policy == "groot":
         print("\njoint frame")
         print("  [ok  ] GR00T new_embodiment learns q01/q99 from this dataset -- no remap needed")
 

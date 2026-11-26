@@ -1,5 +1,6 @@
 # Python environment
 .venv/
+.venv-pi05/
 __pycache__/
 *.py[cod]
 
