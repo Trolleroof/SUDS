@@ -1,0 +1,40 @@
+deployment: suds-pi05
+model:
+  repo_or_path: ""
+  device: cuda
+execution:
+  supported_modes: [rtc_guided]
+  action_fps: 30.0
+  rtc:
+    enabled: true
+    mode: guided
+    execution_horizon: 15
+    prefix_attention_schedule: EXP
+    max_guidance_weight: 10.0
+zenoh:
+  mode: peer
+  listen_endpoints: [tcp/127.0.0.1:7447]
+semantics: so101-degrees-gripper-percent-v1
+robot_type: so101_follower
+features:
+  - name: observation.state
+    shape: [6]
+    dtype: float32
+    names: [shoulder_pan.pos, shoulder_lift.pos, elbow_flex.pos, wrist_flex.pos, wrist_roll.pos, gripper.pos]
+    semantics: so101-degrees-gripper-percent-v1
+  - name: observation.images.overhead
+    shape: [480, 640, 3]
+    dtype: uint8
+    kind: rgb
+    semantics: rgb-overhead-wide-workspace-v1
+  - name: observation.images.wrist
+    shape: [480, 640, 3]
+    dtype: uint8
+    kind: rgb
+    semantics: rgb-wrist-close-gripper-v1
+action_feature:
+  name: action
+  shape: [6]
+  dtype: float32
+  names: [shoulder_pan.pos, shoulder_lift.pos, elbow_flex.pos, wrist_flex.pos, wrist_roll.pos, gripper.pos]
+  semantics: so101-degrees-gripper-percent-v1
